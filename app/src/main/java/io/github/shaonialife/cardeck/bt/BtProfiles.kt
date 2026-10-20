@@ -16,9 +16,8 @@ import java.util.concurrent.atomic.AtomicReference
  * 奥迪 MIB3 实测（2026-10-18，用户报告）：手机与车机处于蓝牙**已连接**状态
  * （HFP 通话 / A2DP 媒体配置文件在线）时，车机不开放无线 CarPlay 的 iAP2 服务
  * 窗口——表现为 `BT-C: 连接失败（车机未就绪或不在无线配对窗口）` 每 3 秒重试。
- * 真 iPhone 的无线 CarPlay 也不依赖这些配置文件：控制通道走 iAP2 RFCOMM（独立
- * SDP 服务），声音走 WiFi 上的 AirPlay。因此正确形态是：**系统级配对 + iAP2
- * RFCOMM，其余配置文件一律不连**。
+ * 该策略仅用于已确认提供 …caff 服务的出站连接准备；主动回连的转换盒可能依赖
+ * HFP 触发启动，不能在配对成功回调里无条件断开。入站一到，调用方应立即停止此处操作。
  *
  * 实现说明：`BluetoothHeadset/A2dp/LeAudio.disconnect(BluetoothDevice)` 是
  * **@SystemApi**——编译期不可见，但运行时注解只要求 `BLUETOOTH_CONNECT`
@@ -76,7 +75,9 @@ object BtProfiles {
     fun disconnect(
         context: Context,
         device: BluetoothDevice,
+        shouldContinue: () -> Boolean = { true },
     ): List<String> {
+        if (!shouldContinue()) return emptyList()
         val address =
             try {
                 device.address
@@ -86,14 +87,15 @@ object BtProfiles {
         val before = connectedNames(context, address)
         if (before.isEmpty()) return emptyList()
         for (id in profiles) {
+            if (!shouldContinue()) return before
             if (profileName(id) !in before) continue
-            proxy(context, id)?.let { disconnectProfile(it, device) }
+            proxy(context, id)?.let { if (shouldContinue()) disconnectProfile(it, device) }
         }
-        if (!awaitDisconnected(context, address, 1_500L)) {
+        if (!awaitDisconnected(context, address, 1_500L, shouldContinue) && shouldContinue()) {
             // 配置级断开未生效（个别 ROM 限流）：设备级断开兜底（@hide，同样只要求
             // BLUETOOTH_CONNECT）。车载/耳机当前连接的设备可能被一并断开，属预期。
             runCatching { BluetoothDevice::class.java.getMethod("disconnect").invoke(device) }
-            awaitDisconnected(context, address, 500L)
+            awaitDisconnected(context, address, 500L, shouldContinue)
         }
         return before
     }
@@ -108,9 +110,11 @@ object BtProfiles {
         context: Context,
         address: String,
         timeoutMillis: Long,
+        shouldContinue: () -> Boolean,
     ): Boolean {
         val deadline = SystemClock.uptimeMillis() + timeoutMillis
         while (SystemClock.uptimeMillis() < deadline) {
+            if (!shouldContinue()) return false
             if (connectedNames(context, address).isEmpty()) return true
             try {
                 Thread.sleep(120)

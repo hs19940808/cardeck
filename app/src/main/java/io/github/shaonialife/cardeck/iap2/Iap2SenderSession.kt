@@ -183,20 +183,16 @@ class Iap2SenderSession(
         // ---- MFi（跳过校验：0xAA05 自报成功）----
         val identityText = identityText(identification)
         val legacyCar = LEGACY_RECEIVER_MARKERS.any { identityText.contains(it) }
-        if (legacyCar) {
-            log("iap2 识别为真车系（$identityText）——MFi 首选 20B（真 iPhone 实录长度；32B 对真车处置不稳定）")
-        }
         send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
         val certificate = expect(Iap2MessageIds.MFI_CERTIFICATE, deadline)
         log("iap2 rx=0xaa01 certificate bytes=${certificate.body.size}（跳过校验）")
-        // 挑战长度按接收端身份选择（2026-10-11 奥迪字节级实测修正）：
-        //  - 真车系（Audi/Delphi MIB 等）：**20B 首试**。真 iPhone 实录（carplay-wifi-extractor
-        //    client）与 catplay 发送端都用 20B；奥迪对 20B 秒答。32B 先行会导致车机
-        //    ACK 挑战帧后**整段静默**（不回 ACK、不回应答，会话变僵尸）——本日多轮实测，
-        //    32B→20B 的会话全部卡死，20B→（记忆命中）的会话全部秒通。
-        //  - 测试台 DiPlay（Carlinkit AuthV3 EC 身份）：**只接受精确 32B**，长度不符直接断链。
-        // 全部无应答也不中止——我们不校验签名（0xAA05 自报），由 0x5702 是否应答判定放行。
-        runMfiChallenge(deadline, prefer20First = legacyCar, receiverKey = identityText)
+        val keyType = MfiCertificateHint.fromBody(certificate.body)
+        val prefer20First = keyType?.let { it.challengeBytes == 20 } ?: legacyCar
+        log(
+            "iap2 MFi 证书公钥=${keyType?.name ?: "未知"}，基线首选 ${if (prefer20First) 20 else 32}B" +
+                "（已成功的车机记忆优先，保留 20B/32B 回退）",
+        )
+        runMfiChallenge(deadline, prefer20First = prefer20First, receiverKey = identityText)
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 authentication-succeeded（自报）")
 
@@ -518,9 +514,16 @@ class Iap2SenderSession(
                 val frame = recvFrame(remaining)
                 if (frame == null) {
                     if (!channel.isAlive) {
-                        log("iap2 MFi 挑战期间链路断开（${size}B，对端不接受该长度）——记入该车机被拒档位")
+                        // 断链可能由长度不兼容或蓝牙干扰造成，不能写成对端明确拒绝。
+                        // 保留既有降级记忆供下一条新链路换档，本链路已死，不能再发 0xAA05。
                         MfiLengthMemory.recordRejected(context, receiverKey, size)
-                        return
+                        val nextOrder =
+                            MfiLengthMemory.orderAttempts(baselineLengths, MfiLengthMemory.load(context, receiverKey))
+                        log(
+                            "iap2 MFi ${size}B 挑战期间链路断开（原因未确认）" +
+                                "——下次重连优先 ${nextOrder.first()}B",
+                        )
+                        throw IOException("iAP2 MFi ${size}B 挑战期间链路断开，等待重连后重试")
                     }
                     continue
                 }
@@ -604,9 +607,12 @@ class Iap2SenderSession(
     private fun expect(
         messageId: Int,
         deadline: Long,
-    ): Iap2Csm.Frame =
-        expectOrNull(messageId, deadline)
-            ?: throw IOException("等待 0x${messageId.toString(16)} 超时")
+    ): Iap2Csm.Frame {
+        val frame = expectOrNull(messageId, deadline)
+        if (frame != null) return frame
+        val outcome = if (channel.isAlive) "超时" else "期间链路断开"
+        throw IOException("等待 0x${messageId.toString(16)} $outcome")
+    }
 
     /**
      * 同 [expect]，但超时返回 null（用于可选消息）。非预期帧进暂存区供后续消费。
