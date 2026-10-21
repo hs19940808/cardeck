@@ -836,11 +836,12 @@ object VirtualLauncher {
     }
 
     /** 进入仪表盘：地图屏缩回 tile、默认地图占屏（缺则启动）、桌面切分屏布局。 */
-    fun showDashboard() {
+    fun showDashboard(): Boolean {
         syncDashboard(true)
-        goGrid()
+        val ok = goGrid()
         composer?.requestActiveApp(appHiDisplayId >= 0 && gridDisplayId == appHiDisplayId)
         logSink?.invoke("LAUNCHER: 仪表盘模式（地图 tile + 音乐卡）")
+        return ok
     }
 
     /**
@@ -874,10 +875,12 @@ object VirtualLauncher {
     }
 
     /** 回普通桌面：隐藏地图层并退出仪表盘，桌面恢复全宽图标网格（地图任务保留）。 */
-    fun showDesktop() {
+    fun showDesktop(): Boolean {
+        if (mapFullscreen) setMapFullscreen(false)
         syncDashboard(false)
-        goGrid()
+        val ok = goGrid()
         logSink?.invoke("LAUNCHER: 桌面模式（图标网格）")
+        return ok
     }
 
     /**

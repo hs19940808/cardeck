@@ -159,16 +159,15 @@ object BinaryPlist {
     }
 
     /**
-     * 整数按 **有符号** 范围选宽度（bplist 规范：整数是有符号的，读取端按符号扩展）。
+     * 负数必须使用 8 字节补码；短整型在标准 bplist 读取端按无符号解释。
+     * 否则资源声明里的 speechMode=-1 会变成 255，而不是「无语音会话」。
      *
-     * 曾按无符号阈值选宽度：35449（0x8A79）被写成 2 字节，Apple 侧按 int16 读成
-     * -30087。整型端口（timingPort/eventPort/dataPort）一旦落到 32768..65535 就会
-     * 变成负值——接收端可能直接拒绝或绑定到错误端口。单测 `SessionSetupBodyTest`
-     * 即由此发现。
+     * 正数保留现有的有符号范围选宽策略，兼容曾按 int16 读端口的接收端。
      */
     private fun encodeInt(value: Long): ByteArray {
         val size =
             when {
+                value < 0 -> 8
                 value >= Byte.MIN_VALUE && value <= Byte.MAX_VALUE -> 1
                 value >= Short.MIN_VALUE && value <= Short.MAX_VALUE -> 2
                 value >= Int.MIN_VALUE && value <= Int.MAX_VALUE -> 4

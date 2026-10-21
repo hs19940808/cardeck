@@ -586,6 +586,15 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
 - **协议差异以日志为准**：测试台（DiPlay）与真车（奥迪 MIB3）行为多处相反（MFi 挑战
   32B/20B、0x4301 有无、ctrl 邀请死锁等），细节见 `docs/PROTOCOL-NOTES.md` §9，
   改协议代码前先对照。
+- **车机导航键可能走 requestUI，资源交接不能只回空 200**（2026-10-21 smartBox +
+  马自达日志）：导航键已把 `requestUI params={url=maps:}` 发到手机，旧代码只记日志；
+  同时收到 `changeModes` 却忽略参数、固定抢回屏幕。现在前者复用默认地图/桌面入口，
+  后者在原 CSeq 的响应体中返回 bplist `status` 与成功后的 `params` 资源快照，再发
+  `modesChanged`。车机 Take 与 Borrow 要分别维护当前/永久归属；用户请求唤起时只
+  取回主屏，不顺带抢原车音频。Shell 启动应用放后台，早于虚拟屏就绪的请求等 attach
+  成功后补发，断开/换会话后丢弃旧请求。资源里的 `speechMode=-1` 必须编码成 8 字节
+  补码（marker 0x13），缩成 1 字节会被标准 bplist 读成 255。软件回归检查不能替代
+  同一盒子上的「按导航键进入 CarPlay、退回原车、再次唤起」实车验收。
 - **老车机（CarPlay 210.81 / 奥迪 4xxx 固件）必须按 catplay 的「三时代」分类处理**
   （2026-10-19 定谳，`docs/PROTOCOL-NOTES.md` §9f）：该代是 **pre-HomeKit** 接收端
   （`_airplay._tcp` features 无 bit38 `HK_PAIRING_AND_ENCRYPT`），只接受

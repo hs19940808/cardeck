@@ -3,6 +3,7 @@ package io.github.shaonialife.cardeck
 import android.content.Context
 import android.view.KeyEvent
 import io.github.shaonialife.cardeck.airplay.AirPlayClient
+import io.github.shaonialife.cardeck.airplay.CarPlayUiRequest
 import io.github.shaonialife.cardeck.airplay.PairVerifyClient
 import io.github.shaonialife.cardeck.audio.AudioProfile
 import io.github.shaonialife.cardeck.audio.AudioProfileMemory
@@ -19,6 +20,7 @@ import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
 import io.github.shaonialife.cardeck.input.ConsumerKeys
 import io.github.shaonialife.cardeck.input.TouchReports
 import io.github.shaonialife.cardeck.input.TouchRouter
+import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
 import io.github.shaonialife.cardeck.net.AirPlayFeatures
@@ -40,6 +42,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 进程级会话中枢：**日志缓冲**与**会话管线所有权**的唯一持有者。
@@ -234,6 +237,70 @@ object SessionController {
 
     @Volatile
     var currentHiddenSource: HiddenDisplaySource? = null
+
+    private val pendingUiRequest = AtomicReference<Pair<AirPlayClient, CarPlayUiRequest>?>()
+    private val uiRequestLock = Any()
+
+    /** 合并尚未执行的按键请求；虚拟屏尚未就绪时由 attach 成功后补发。 */
+    private fun requestCarPlayUi(
+        client: AirPlayClient,
+        command: Map<*, *>,
+    ) {
+        val target = CarPlayUiRequest.from(command)
+        if (target == null) {
+            appendLog("EVENT: requestUI 未支持的页面 params=${command["params"]}")
+            return
+        }
+        if (currentClient !== client || client.cancelled || connectCancelled) return
+        pendingUiRequest.set(client to target)
+        appendLog("EVENT: requestUI params=${command["params"]} → 排队唤起 $target")
+        deliverPendingCarPlayUi()
+    }
+
+    /** 启动应用只在后台串行执行，避免阻塞事件 ACK 或让连续导航键争抢地图屏。 */
+    private fun deliverPendingCarPlayUi() {
+        Bg.run("carplay-request-ui") {
+            synchronized(uiRequestLock) {
+                val pending = pendingUiRequest.get() ?: return@run
+                val (client, target) = pending
+                if (currentClient !== client || client.cancelled || connectCancelled) {
+                    pendingUiRequest.compareAndSet(pending, null)
+                    return@run
+                }
+                if (currentHiddenSource?.displayId?.let { it >= 0 } != true || videoSender?.isRunning != true) return@run
+                if (!pendingUiRequest.compareAndSet(pending, null)) return@run
+                try {
+                    val context = appContext ?: return@run
+                    val opened = openCarPlayUi(context, target)
+                    if (currentClient === client && !client.cancelled && !connectCancelled) {
+                        val keyFrame = videoSender?.requestKeyFrame() == true
+                        appendLog("EVENT: requestUI $target → 页面唤起=$opened，关键帧请求=$keyFrame")
+                    }
+                } catch (error: Exception) {
+                    appendLog("EVENT: requestUI $target 唤起失败 - ${error.message}")
+                }
+            }
+        }
+    }
+
+    /** 复用已有虚拟屏入口；没有默认地图时回桌面，避免停留在无内容的地图层。 */
+    private fun openCarPlayUi(
+        context: Context,
+        target: CarPlayUiRequest,
+    ): Boolean =
+        when (target) {
+            CarPlayUiRequest.MAPS -> {
+                val component = VirtualLauncher.defaultMapComponent(context)
+                if (component != null && VirtualLauncher.launchApp(component)) {
+                    true
+                } else {
+                    appendLog("EVENT: 默认地图不可用 → 回到 CarDeck 桌面")
+                    VirtualLauncher.showDesktop()
+                }
+            }
+            CarPlayUiRequest.HOME -> VirtualLauncher.showDesktop()
+            CarPlayUiRequest.MUSIC -> VirtualLauncher.showDashboard()
+        }
 
     /** 当前会话的共享密钥与接收端地址：投影授权晚于连接时，动态补启音频用。 */
     @Volatile
@@ -559,6 +626,7 @@ object SessionController {
 
     /** 会话结束/新周期开始前彻底退役上一代会话（旧管线泄漏会累积编码器/虚拟显示器，最终 dequeueBuffer -19）。 */
     fun retireSession() {
+        pendingUiRequest.set(null)
         videoSender?.stop()
         videoSender = null
         // 暗幕/常亮随会话收掉（本方法在每轮配对起步也会执行，新一轮推流起来后会重新置位）
@@ -1857,7 +1925,8 @@ object SessionController {
                             currentSharedSecret = sessionKey
                             currentAudioHost =
                                 client.activeHost ?: EndpointHosts.candidates(client.currentEndpoint.ipAddresses).firstOrNull()
-                            client.connectEventChannel(sessionKey, setup) { command ->
+                            client.connectEventChannel(sessionKey, setup) commands@{ command ->
+                                if (currentClient !== client || client.cancelled || connectCancelled) return@commands
                                 when (command["type"]) {
                                     "hidSendReport" -> {
                                         val uuid = command["uuid"]?.toString()
@@ -1962,16 +2031,11 @@ object SessionController {
                                         )
                                     }
 
-                                    "changeModes" -> {
-                                        // 车机请求资源仲裁（如用户在 MMI 上点了手机）：
-                                        // 回 modesChanged 声明手机持有主屏/主音频
-                                        appendLog("EVENT: 车机请求 changeModes → 回 modesChanged 接管资源")
-                                        client.assertModes()
-                                    }
+                                    "requestUI" -> requestCarPlayUi(client, command)
 
                                     else ->
                                         appendLog(
-                                            // 未识别的命令必须带参数：车机的私有命令（如 requestUI）
+                                            // 未识别的命令必须带参数：车机的私有命令
                                             // 到底要什么，全在 params 里——只打 type 等于没打。
                                             "EVENT: 命令 type=${command["type"]} " +
                                                 command.entries
@@ -2144,7 +2208,10 @@ object SessionController {
                                         )
                                         // 暗幕/常亮只在真正开始投屏后生效（见 ScreenDimmer.sessionActive）：
                                         // 应用启动时只挂触摸探针，避免「会话早断了、手机过一会儿还是变暗」。
-                                        if (ok) ScreenDimmer.setSessionActive(true)
+                                        if (ok) {
+                                            ScreenDimmer.setSessionActive(true)
+                                            deliverPendingCarPlayUi()
+                                        }
                                     }
                                 }
                                 // 音频通道（可选）：SETUP type=100 → UDP RTP 推流。

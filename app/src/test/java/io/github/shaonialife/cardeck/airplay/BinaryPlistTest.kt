@@ -88,6 +88,18 @@ class BinaryPlistTest {
         }
     }
 
+    /** 标准 bplist 的负数使用 marker=0x13 和 8 字节补码，不能缩成无符号短整型。 */
+    @Test
+    fun negativeIntegersKeepTheirSignInTheWireFormat() {
+        for (value in listOf(-1L, -128L, -32768L, Long.MIN_VALUE)) {
+            val encoded = BinaryPlist.encode(value)
+            assertEquals(0x13, encoded[8].toInt() and 0xFF)
+            assertEquals(value, BinaryPlist.parse(encoded))
+        }
+        val noSpeech = BinaryPlist.encode(-1L)
+        assertArrayEquals(ByteArray(8) { 0xFF.toByte() }, noSpeech.copyOfRange(9, 17))
+    }
+
     @Test
     fun encodeLongAndUnicodeStrings() {
         val longAscii = "x".repeat(300)
