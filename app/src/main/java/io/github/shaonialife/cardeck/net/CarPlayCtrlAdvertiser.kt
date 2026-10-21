@@ -66,6 +66,13 @@ class CarPlayCtrlAdvertiser(
     @Volatile
     private var registered = false
 
+    /** HTTP 应答完成后将连接邀请交给主控，接线不依赖蓝牙端点回调。 */
+    internal var onInvite: ((CarPlayCtrlInvite) -> Unit)? = null
+
+    private val inviteGeneration =
+        java.util.concurrent.atomic
+            .AtomicLong(0)
+
     /**
      * 车机 ctrl 邀请计数（每次 `GET /ctrl-int/1/connect` 加一）。
      *
@@ -79,6 +86,7 @@ class CarPlayCtrlAdvertiser(
 
     /** 新一轮连接开始时清零（避免把上一轮的邀请当成本轮信号）。 */
     fun resetInviteCount() {
+        inviteGeneration.incrementAndGet()
         inviteCount = 0
     }
 
@@ -201,7 +209,8 @@ class CarPlayCtrlAdvertiser(
                 // 别让「广播提前到启动连接」反而把 TXT id 写错（2026-10-18）。
                 Bg.run("ctrl-mac-repair") { repairPlaceholderMac() }
             }
-            Thread(::acceptLoop, "ctrl-accept").apply {
+            val generation = inviteGeneration.get()
+            Thread({ acceptLoop(socket, generation) }, "ctrl-accept").apply {
                 isDaemon = true
                 start()
             }
@@ -230,8 +239,11 @@ class CarPlayCtrlAdvertiser(
         log("$TAG: 30s 内未能解析真实蓝牙 MAC——ctrl 广播 id 仍是占位值，车机可能不会邀请（请确认 Shizuku 已启动）")
     }
 
-    private fun acceptLoop() {
-        val socket = serverSocket ?: return
+    /** 固定本轮监听 socket 与代次，旧线程不能在重注册后借用新监听器。 */
+    private fun acceptLoop(
+        socket: ServerSocket,
+        generation: Long,
+    ) {
         while (registered) {
             val client =
                 try {
@@ -239,11 +251,14 @@ class CarPlayCtrlAdvertiser(
                 } catch (_: Exception) {
                     break
                 }
-            Bg.run("ctrl-client") { handleClient(client) }
+            Bg.run("ctrl-client") { handleClient(client, generation) }
         }
     }
 
-    private fun handleClient(client: Socket) {
+    private fun handleClient(
+        client: Socket,
+        generation: Long,
+    ) {
         val peer = client.inetAddress?.hostAddress ?: "?"
         try {
             client.soTimeout = 10_000
@@ -262,18 +277,11 @@ class CarPlayCtrlAdvertiser(
                     .joinToString("; ") { it.trim() }
             log("$TAG: $peer -> [$requestLine] $headers")
 
-            // 车机 ctrl 邀请：这是「车机已发现手机、AirPlay 窗口已开」的权威信号
-            // （catplay CarPlayCtrlSession：收到即把邀请交给连接流程）。
-            if (requestLine.startsWith("GET /ctrl-int/1/connect")) {
-                val receiverId =
-                    head
-                        .lineSequence()
-                        .firstOrNull {
-                            it.substringBefore(':').trim().equals("AirPlay-Receiver-Device-ID", ignoreCase = true)
-                        }?.substringAfter(':')
-                        ?.trim()
+            // 收到邀请即交给连接流程；RTSP 端口是否开放仍由实际连接结果确认。
+            val invite = CarPlayCtrlInvite.parse(head, peer, client.localAddress.hostAddress.orEmpty())
+            if (invite != null && generation == inviteGeneration.get()) {
                 inviteCount++
-                log("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${receiverId ?: "?"}）——AirPlay 窗口已开启")
+                log("$TAG: ✓ 收到车机 ctrl 邀请（第 $inviteCount 次，receiver=${invite.receiverId ?: "?"}）——交给会话流程")
             }
 
             val output = client.getOutputStream()
@@ -291,6 +299,7 @@ class CarPlayCtrlAdvertiser(
                 }
             output.write(response.toByteArray(Charsets.US_ASCII))
             output.flush()
+            if (invite != null && generation == inviteGeneration.get()) onInvite?.invoke(invite)
 
             // 对端 Connection: close 会自行断开；等待期间若还有字节（隧道/事件），转储出来
             client.soTimeout = 3_000
@@ -342,6 +351,8 @@ class CarPlayCtrlAdvertiser(
 
     @Synchronized
     fun stop() {
+        // 重注册也走 stop()：保留已收到的邀请，只有用户新一轮连接才清零计数。
+        inviteGeneration.incrementAndGet()
         registered = false
         registeredSsid = null
         registeredWithMac = null

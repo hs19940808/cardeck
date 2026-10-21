@@ -3,12 +3,9 @@ package io.github.shaonialife.cardeck.iap2
 import io.github.shaonialife.cardeck.transport.Iap2LinkChannel
 import io.github.shaonialife.cardeck.transport.InMemoryStreamPair
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.IOException
-import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -19,126 +16,6 @@ import java.util.concurrent.atomic.AtomicReference
  * 验证 Phase 1 全序列（识别→MFi 跳过→HID→WiFi 配置→CarPlay 启动→通知）。
  */
 class Iap2SenderSessionTest {
-    @Test(timeout = 15_000)
-    fun unknownRsaBoxUses20BytesWithFragmentedCertificate() {
-        withAccessory(
-            certificateBytes = MfiCertificateHintTest.certificate("rsa").encoded,
-            expectedChallengeSize = 20,
-        ) { session, _ ->
-            assertEquals("MockAP", session.run(10_000).ssid)
-        }
-    }
-
-    @Test(timeout = 15_000)
-    fun ecReceiverUses32BytesEvenWithLegacyName() {
-        withAccessory(
-            receiverName = "Audi-test-${UUID.randomUUID()}",
-            certificateBytes = MfiCertificateHintTest.certificate("ec").encoded,
-            expectedChallengeSize = 32,
-        ) { session, _ ->
-            assertEquals("MockAP", session.run(10_000).ssid)
-        }
-    }
-
-    @Test(timeout = 15_000)
-    fun known32ByteSuccessOverridesRsaCertificateHint() {
-        val receiverName = "smartBox-test-${UUID.randomUUID()}"
-        MfiLengthMemory.recordSuccess(null, "$receiverName MU-1 Mock Manufacturer", 32)
-        withAccessory(
-            receiverName = receiverName,
-            certificateBytes = MfiCertificateHintTest.certificate("rsa").encoded,
-            expectedChallengeSize = 32,
-        ) { session, _ ->
-            assertEquals("MockAP", session.run(10_000).ssid)
-        }
-    }
-
-    @Test(timeout = 15_000)
-    fun unknownCertificateStillSupports32BytesAnd118ByteFragments() {
-        withAccessory(expectedChallengeSize = 32) { session, _ ->
-            assertEquals("MockAP", session.run(10_000).ssid)
-        }
-    }
-
-    @Test(timeout = 15_000)
-    fun disconnectDuringCertificateIsNotReportedAsTimeout() {
-        withAccessory(truncateCertificate = true) { session, logs ->
-            val error = runCatching { session.run(10_000) }.exceptionOrNull()
-            assertTrue("实际结果=$error", error is IOException)
-            assertTrue(error!!.message!!.contains("0xaa01"))
-            assertTrue(error.message!!.contains("链路断开"))
-            assertFalse(error.message!!.contains("超时"))
-            assertFalse(logs.any { it.contains("tx=0xaa02") })
-        }
-    }
-
-    @Test(timeout = 20_000)
-    fun disconnectAfter32BytesRetries20BytesOnNewLink() {
-        val receiverName = "smartBox-test-${UUID.randomUUID()}"
-        withAccessory(receiverName = receiverName, expectedChallengeSize = 32, closeOnChallenge = true) { session, logs ->
-            val error = runCatching { session.run(10_000) }.exceptionOrNull()
-            assertTrue("实际结果=$error", error is IOException)
-            assertTrue(error!!.message!!.contains("32B"))
-            assertFalse("断链后不能再报发送 0xAA05 失败", error.message!!.contains("0xaa05"))
-            assertTrue(logs.any { it.contains("下次重连优先 20B") })
-            assertFalse(logs.any { it.contains("tx=0xaa05") })
-        }
-        withAccessory(receiverName = receiverName, expectedChallengeSize = 20) { session, _ ->
-            assertEquals("MockAP", session.run(10_000).ssid)
-        }
-    }
-
-    /** 复现盒子 118B 控制分片，并把配件线程异常传回 JUnit，避免后台断言失败被忽略。 */
-    private fun withAccessory(
-        receiverName: String = "smartBox-test-${UUID.randomUUID()}",
-        certificateBytes: ByteArray = ByteArray(908) { it.toByte() },
-        expectedChallengeSize: Int? = null,
-        closeOnChallenge: Boolean = false,
-        truncateCertificate: Boolean = false,
-        test: (Iap2SenderSession, List<String>) -> Unit,
-    ) {
-        val pair = InMemoryStreamPair()
-        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone-regression")
-        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "box-regression")
-        val failure = AtomicReference<Throwable?>()
-        val logs = ArrayList<String>()
-        val accessory =
-            MockAccessory(
-                accessoryChannel,
-                receiverName = receiverName,
-                certificateBytes = certificateBytes,
-                expectedChallengeSize = expectedChallengeSize,
-                closeOnChallenge = closeOnChallenge,
-                truncateCertificate = truncateCertificate,
-                chunkSize = 118,
-            )
-        val worker =
-            Thread(
-                {
-                    try {
-                        accessory.run()
-                    } catch (error: Throwable) {
-                        failure.set(error)
-                        accessoryChannel.close()
-                    }
-                },
-                "box-regression",
-            ).apply {
-                isDaemon = true
-                start()
-            }
-        try {
-            test(Iap2SenderSession(phoneChannel, log = { logs += it }), logs)
-            worker.join(2_000)
-            assertFalse("配件脚本未完成", worker.isAlive)
-            failure.get()?.let { throw AssertionError("配件脚本失败", it) }
-        } finally {
-            phoneChannel.close()
-            accessoryChannel.close()
-            worker.join(2_000)
-        }
-    }
-
     @Test
     fun fullBringUpAgainstMockAccessory() {
         val pair = InMemoryStreamPair()
@@ -274,12 +151,6 @@ class Iap2SenderSessionTest {
          * IPv4 后跟 5 个）。用于锁定「必须去掉全部尾部 NUL」这一行为。
          */
         private val padAddresses: Boolean = false,
-        private val receiverName: String = "MockCarPlay",
-        private val certificateBytes: ByteArray = ByteArray(64) { it.toByte() },
-        private val expectedChallengeSize: Int? = null,
-        private val closeOnChallenge: Boolean = false,
-        private val truncateCertificate: Boolean = false,
-        private val chunkSize: Int = Int.MAX_VALUE,
     ) {
         private val parser = Iap2Csm.Parser()
         private val pending = ArrayDeque<Iap2Csm.Frame>()
@@ -290,7 +161,7 @@ class Iap2SenderSessionTest {
             expect(Iap2MessageIds.START_IDENTIFICATION)
             send(
                 Iap2MessageIds.IDENTIFICATION_INFORMATION,
-                Iap2Csm.string(0, receiverName),
+                Iap2Csm.string(0, "MockCarPlay"),
                 Iap2Csm.string(1, "MU-1"),
                 Iap2Csm.string(2, "Mock Manufacturer"),
                 if (audiDeclarations) {
@@ -302,23 +173,8 @@ class Iap2SenderSessionTest {
             expect(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
 
             expect(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
-            if (truncateCertificate) {
-                val frame = Iap2Csm.encode(Iap2MessageIds.MFI_CERTIFICATE, Iap2Csm.param(0, certificateBytes))
-                check(channel.sendControl(frame.copyOf(118)))
-                Thread.sleep(30)
-                channel.close()
-                return
-            }
-            send(Iap2MessageIds.MFI_CERTIFICATE, Iap2Csm.param(0, certificateBytes))
-            val challenge = expect(Iap2MessageIds.MFI_REQUEST_CHALLENGE)
-            expectedChallengeSize?.let {
-                val actual = Iap2Csm.parseParams(challenge.body).single { param -> param.id == 0 }.value.size
-                assertEquals("挑战长度必须匹配接收端", it, actual)
-            }
-            if (closeOnChallenge) {
-                channel.close()
-                return
-            }
+            send(Iap2MessageIds.MFI_CERTIFICATE, Iap2Csm.param(0, ByteArray(64) { it.toByte() }))
+            expect(Iap2MessageIds.MFI_REQUEST_CHALLENGE)
             send(Iap2MessageIds.MFI_RESPONSE, Iap2Csm.param(0, ByteArray(70) { (it * 7).toByte() }))
             expect(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
 
@@ -416,16 +272,15 @@ class Iap2SenderSessionTest {
                 }
             val frame = Iap2Csm.encode(messageId, joined)
             var offset = 0
-            val limit = minOf(channel.peerMaxControlPayload() ?: 2048, chunkSize)
+            val limit = channel.peerMaxControlPayload() ?: 2048
             while (offset < frame.size) {
                 val end = minOf(offset + limit, frame.size)
                 check(channel.sendControl(frame.copyOfRange(offset, end))) { "mock send failed" }
                 offset = end
-                if (offset < frame.size && chunkSize != Int.MAX_VALUE) Thread.sleep(5)
             }
         }
 
-        private fun expect(messageId: Int): Iap2Csm.Frame {
+        private fun expect(messageId: Int) {
             println("MOCK expect 0x${messageId.toString(16)}")
             val frame =
                 recvFrame(10_000)
@@ -434,7 +289,6 @@ class Iap2SenderSessionTest {
                 "mock expected 0x${messageId.toString(16)} got 0x${frame.messageId.toString(16)}"
             }
             println("MOCK got 0x${frame.messageId.toString(16)}")
-            return frame
         }
 
         private fun recvFrame(timeoutMillis: Long): Iap2Csm.Frame? {

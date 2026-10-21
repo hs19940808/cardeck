@@ -23,7 +23,9 @@ import io.github.shaonialife.cardeck.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
 import io.github.shaonialife.cardeck.net.AirPlayFeatures
 import io.github.shaonialife.cardeck.net.CarPlayCtrlAdvertiser
+import io.github.shaonialife.cardeck.net.CarPlayCtrlInvite
 import io.github.shaonialife.cardeck.net.CarPlayServiceBrowser
+import io.github.shaonialife.cardeck.net.CtrlInviteGate
 import io.github.shaonialife.cardeck.net.EndpointHosts
 import io.github.shaonialife.cardeck.net.WifiCarPlayConnector
 import io.github.shaonialife.cardeck.net.WifiSavedNetworks
@@ -203,6 +205,7 @@ object SessionController {
     private var bluetoothServer: Iap2BluetoothServer? = null
     private var bluetoothClient: Iap2BluetoothClient? = null
     private var ctrlAdvertiser: CarPlayCtrlAdvertiser? = null
+    private val ctrlInviteGate = CtrlInviteGate()
 
     /**
      * 常驻 `_airplay._tcp` 发现器（对照 catplay 的常驻 Bonjour cache）。
@@ -372,7 +375,10 @@ object SessionController {
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "主动连车机") },
                     targetProvider = targetProvider,
                 )
-            ctrlAdvertiser = CarPlayCtrlAdvertiser(context) { line -> appendLog(line) }
+            ctrlAdvertiser =
+                CarPlayCtrlAdvertiser(context) { line -> appendLog(line) }.also {
+                    it.onInvite = ::onCtrlInvite
+                }
             endpointBrowser =
                 CarPlayServiceBrowser(
                     context,
@@ -395,6 +401,69 @@ object SessionController {
         }
     }
 
+    /**
+     * 已手动加入盒子热点时，由 WiFi 邀请补齐蓝牙未交接端点的入口。
+     * 仅接受选定设备的同名热点，并核对收包网络，避免误连同网的其它 AirPlay 接收器。
+     */
+    private fun onCtrlInvite(invite: CarPlayCtrlInvite) {
+        if (connectCancelled) return
+        val ticket =
+            ctrlInviteGate.acquire(
+                bluetoothActive = hasBtControlSession(),
+                airPlayActive = sessionStarting.get() || videoSender?.isRunning == true,
+            ) ?: return
+        Bg.run("ctrl-invite-connect") {
+            try {
+                val context = appContext ?: return@run
+                val target = TargetDevicePrefs.get(context) ?: return@run
+                if (ShizukuGate.state(context) != ShizukuGate.State.READY) return@run
+                val ssid = shellWifiStatus().second
+                if (!invite.matchesHotspot(target.name, ssid)) {
+                    appendLog("CTRL: 邀请来自 ${invite.peerAddress}，当前热点 $ssid 与选定设备 ${target.name} 不同——保留蓝牙连接流程")
+                    return@run
+                }
+
+                fun cancelled(): Boolean =
+                    connectCancelled ||
+                        !ctrlInviteGate.isCurrent(ticket) ||
+                        TargetDevicePrefs.get(context) != target
+                if (cancelled() || sessionStarting.get() || hasBtControlSession()) return@run
+                val carSsid = ssid ?: return@run
+                if (!bindCarWifiAndRegister(carSsid, ::cancelled) || cancelled()) return@run
+                if (sessionStarting.get() || hasBtControlSession()) return@run
+                if (!invite.matchesNetwork(wifiConnector?.localIpv4Address(), wifiConnector?.localIpv6Addresses().orEmpty())) {
+                    appendLog("CTRL: 收到邀请后 WiFi 网络已变化——忽略旧邀请，等待车机重发")
+                    return@run
+                }
+                appendLog("CTRL: ✓ 选定设备热点 $carSsid 已确认——由 ${invite.peerAddress} 的邀请启动 AirPlay（不再等待蓝牙交接）")
+                onCarPlayEndpoint(
+                    Iap2SenderSession.CarPlayEndpoint(
+                        ssid = carSsid,
+                        passphrase = "",
+                        channel = 0,
+                        securityType = 0,
+                        airPlayPort = 0,
+                        deviceIdentifier = null,
+                        publicKey = null,
+                        sourceVersion = null,
+                        ipAddresses = listOf(invite.peerAddress),
+                    ),
+                    "WiFi ctrl 邀请",
+                    invitedPeer = invite.peerAddress,
+                )
+            } catch (error: Exception) {
+                if (!connectCancelled && ctrlInviteGate.isCurrent(ticket)) {
+                    appendLog("CTRL: 邀请交接失败 - ${error.message ?: error.javaClass.simpleName}")
+                }
+            } finally {
+                ctrlInviteGate.release(ticket)
+            }
+        }
+    }
+
+    /** 正常蓝牙握手已经在跑时，WiFi 邀请只作为其就绪信号，不另起兜底流程。 */
+    private fun hasBtControlSession(): Boolean = BtSessionGate.inboundActive || bluetoothClient?.hasActiveSession == true
+
     /** 状态行文本（Activity 渲染 statusText 用）。 */
     fun statusLine(): String =
         "wifi=${wifiConnector?.currentNetwork != null} " +
@@ -412,6 +481,7 @@ object SessionController {
      */
     fun startConnection(context: Context) {
         connectCancelled = false
+        ctrlInviteGate.start()
         phaseHint = "蓝牙就绪，等待车机回连…"
         when (
             ShizukuGate
@@ -459,6 +529,8 @@ object SessionController {
 
     /** 「断开连接」（可在任意 Activity 实例上调用——操作的是真管线对象）。 */
     fun disconnect(context: Context) {
+        connectCancelled = true
+        ctrlInviteGate.stop()
         val hadProjection = CarPlayService.mediaProjection != null
         pendingEndpointUpdate = null
         retireSession()
@@ -927,9 +999,13 @@ object SessionController {
      *
      * @return 进程网络是否绑定成功
      */
-    private fun bindCarWifiAndRegister(ssid: String): Boolean {
+    private fun bindCarWifiAndRegister(
+        ssid: String,
+        isCancelled: () -> Boolean = { connectCancelled },
+    ): Boolean {
         var bound = false
         synchronized(wifiBindLock) {
+            if (isCancelled()) return false
             // 另一个路径已经绑定同一热点：别再走一遍 release+requestNetwork
             if (boundCarSsid == ssid && wifiConnector?.currentNetwork != null) {
                 bound = true
@@ -941,7 +1017,7 @@ object SessionController {
                 }
                 // 分片等待：期间用户取消要能立刻退出，不必等满窗口
                 val deadline = android.os.SystemClock.uptimeMillis() + WIFI_BIND_WAIT_S * 1_000
-                while (!connectCancelled &&
+                while (!isCancelled() &&
                     bound.not() &&
                     android.os.SystemClock.uptimeMillis() < deadline
                 ) {
@@ -950,12 +1026,12 @@ object SessionController {
                 if (bound) boundCarSsid = ssid
             }
         }
-        if (bound && !connectCancelled) {
+        if (bound && !isCancelled()) {
             phaseHint = "已加入车机热点"
             // 关键时机：bindProcessToNetwork 完成后再注册，车机才能看到 ctrl 广播
             ctrlAdvertiser?.ensureForNetwork(ssid, force = true, network = wifiConnector?.currentNetwork)
             appendLog(">>> WiFi 已绑定车机热点，ctrl 广播已重新注册，等待车机 ctrl 邀请（随后才回 0x4301）")
-        } else if (!connectCancelled) {
+        } else if (!isCancelled()) {
             phaseHint = "手机不在车机热点——请到 WLAN 设置加入 $ssid"
             appendLog(
                 ">>> 等待 ${WIFI_BIND_WAIT_S}s 仍未绑定到 \"$ssid\"——" +
@@ -1297,9 +1373,10 @@ object SessionController {
     private fun resolveEndpointHost(
         endpoint: Iap2SenderSession.CarPlayEndpoint,
         source: String,
+        invitedPeer: String? = null,
     ): Iap2SenderSession.CarPlayEndpoint {
         var effective = endpoint
-        val cached = endpointBrowser?.awaitEndpoint(0)
+        val cached = endpointBrowser?.awaitEndpoint(0, invitedPeer)
         if (cached != null) {
             effective = mergeBrowserEndpoint(effective, cached, source, needPort = effective.airPlayPort <= 0)
         }
@@ -1308,18 +1385,18 @@ object SessionController {
         if (!needHost && !needPort) return effective
 
         phaseHint = "mDNS 解析车机地址…"
-        appendLog(">>> [$source] 0x4301 端点不完整（port=${effective.airPlayPort} ips=${effective.ipAddresses}），取 mDNS 车机 _airplay._tcp…")
+        appendLog(">>> [$source] 接收端信息不完整（port=${effective.airPlayPort} ips=${effective.ipAddresses}），取 mDNS 车机 _airplay._tcp…")
         // 用常驻发现器的缓存（绑网时已开始后台发现，通常此时已命中）。
         // 此前现起一次发现并硬重试 3×6s：车机 mDNS 稳定时白等，不稳定时又拖满 18s。
         // 网段过滤（防误连同网 macOS 接收器）由 browser 的 accept 统一做。
         val info =
-            endpointBrowser?.awaitEndpoint(ENDPOINT_RESOLVE_WAIT_MS) ?: run {
+            endpointBrowser?.awaitEndpoint(ENDPOINT_RESOLVE_WAIT_MS, invitedPeer) ?: run {
                 // 兜底：热点场景车机 IP = 网关（Audi 实测 .1，但取网关更通用）。
                 // mDNS 在部分网络/机型上不稳定（2026-10-11 实测车机 mDNS 时有时无）；
                 // 网关地址 + 默认端口 7000 直接连，AirPlay 端口是固定约定。
-                val gateway = wifiConnector?.gatewayAddress()
+                val gateway = invitedPeer ?: wifiConnector?.gatewayAddress()
                 if (gateway != null && EndpointHosts.candidates(listOf(gateway)).isNotEmpty()) {
-                    appendLog(">>> [$source] mDNS 未发现，兜底使用网关地址 $gateway:7000（车机热点网关=车机）")
+                    appendLog(">>> [$source] mDNS 未发现，兜底使用${if (invitedPeer == null) "网关" else "邀请来源"}地址 $gateway:7000")
                     return effective.copy(
                         ipAddresses = listOf(gateway) + effective.ipAddresses,
                         airPlayPort = if (needPort) 7000 else effective.airPlayPort,
@@ -1440,8 +1517,9 @@ object SessionController {
     private fun enrichEndpointFromBrowser(
         endpoint: Iap2SenderSession.CarPlayEndpoint,
         source: String,
+        invitedPeer: String? = null,
     ): Iap2SenderSession.CarPlayEndpoint? {
-        val info = endpointBrowser?.awaitEndpoint(0) ?: return null
+        val info = endpointBrowser?.awaitEndpoint(0, invitedPeer) ?: return null
         var result = endpoint
         val address = info.host?.hostAddress
         if (address != null &&
@@ -1540,12 +1618,14 @@ object SessionController {
         return null
     }
 
-    /** BT 会话交接点：拿到 0x5703/0x4301 后两条路径流程一致——绑 WiFi → AirPlay 配对 → SETUP → 推流。 */
+    /** 蓝牙端点与已确认的 WiFi 邀请共用：绑 WiFi → AirPlay 配对 → SETUP → 推流。 */
     private fun onCarPlayEndpoint(
         endpoint: Iap2SenderSession.CarPlayEndpoint,
         source: String,
+        invitedPeer: String? = null,
     ) {
         val context = appContext ?: return
+        if (connectCancelled) return
         // 冗余端点防护：接收端控制器（DiPlay 实测）在我们配对推流后才完成既有的
         // RFCOMM 重连并重发 0x4301。此时重启配对会 retireSession 掉健康会话
         // （编码器 stop 竞态 = 「连上后自动断开」循环的根因）。推流中的端点一律忽略；
@@ -1565,7 +1645,7 @@ object SessionController {
             ">>> [$source] 拿到接收端热点：SSID=${endpoint.ssid}；" +
                 "密码=${if (endpoint.passphrase.isEmpty()) "(空)" else "已获取"}",
         )
-        phaseHint = "蓝牙已连上车机，解析热点地址…"
+        phaseHint = "已发现车机，解析连接地址…"
         ssidSink?.invoke(endpoint.ssid)
         // 诊断（老车机排查必看）：地址是 IPv4 还是只有 IPv6、TXT features 是否声明配对能力。
         // 奥迪 4xxx 两种「连不上」都源于这里——旧版日志里完全没有这两项。
@@ -1628,7 +1708,7 @@ object SessionController {
                     }
                     // 端点解析放在邀请之后：车机的 `_airplay._tcp` 常在受邀后才上线，
                     // 且这一步最长 3s——必须在后台线程做，不能占住网络回调线程。
-                    var effectiveEndpoint = resolveEndpointHost(endpoint, source)
+                    var effectiveEndpoint = resolveEndpointHost(endpoint, source, invitedPeer)
                     // 交接流程起步期间车机补发的 0x4301（比 mDNS 合成更权威）在此并入。
                     pendingEndpointUpdate?.let { late ->
                         pendingEndpointUpdate = null
@@ -1649,7 +1729,7 @@ object SessionController {
                             effectiveEndpoint,
                             log = { line -> appendLog(line) },
                             context = context.applicationContext,
-                            endpointRefresher = { current -> enrichEndpointFromBrowser(current, source) },
+                            endpointRefresher = { current -> enrichEndpointFromBrowser(current, source, invitedPeer) },
                             retryTick = { attempt ->
                                 // 配对重试期间车机仍可能没探测到 ctrl（Bonjour 漏掉首次公告）：
                                 // 周期性强制重播一次，并把 mDNS 现状写进日志——否则排查时
@@ -2128,6 +2208,9 @@ object SessionController {
         if (boundCarSsid == endpoint.ssid && wifiConnector?.currentNetwork != null) {
             appendLog(">>> [$source] 已绑定车机热点 ${endpoint.ssid}，跳过重复绑定")
             continueWithNetwork(true)
+        } else if (invitedPeer != null) {
+            sessionStarting.set(false)
+            appendLog("CTRL: 邀请对应的热点已断开——等待重新连接热点后车机重发邀请")
         } else {
             // 端点先于 0x5703 到达（或上一轮换网失败）：同样走应用专属网络。
             // 不能再用「按 TRANSPORT_WIFI 盲绑当前任意 WiFi」——切网途中会绑到旧网络，

@@ -124,48 +124,30 @@ class Iap2BluetoothServer(
                 runCatching { socket.close() }
                 continue
             }
-            // accept 后立即占用门闸，不能等新线程启动才置位，否则出站可能仍在断 HFP。
-            val accepted =
-                if (running && peerAddress != null && !BtSessionGate.sessionActive) {
-                    BtSessionGate.connections.beginInbound(peerAddress)
-                } else {
-                    null
-                }
-            if (accepted == null) {
-                log("BT: 当前已有会话或监听已停止，忽略重复连入 name=$peerName")
-                runCatching { socket.close() }
-                continue
-            }
             log("BT: 接收端已连入 name=$peerName，开始 iAP2 发送端会话")
-            Thread({ runSession(socket, accepted) }, "iap2-bt-session").apply {
+            Thread({ runSession(socket) }, "iap2-bt-session").apply {
                 isDaemon = true
                 start()
             }
         }
     }
 
-    private fun runSession(
-        socket: BluetoothSocket,
-        accepted: BtConnectionArbiter.Inbound,
-    ) {
-        var channel: Iap2LinkChannel? = null
+    private fun runSession(socket: BluetoothSocket) {
+        val stream =
+            StreamDuplexStream(socket.inputStream, socket.outputStream) {
+                runCatching { socket.close() }
+            }
+        val channel = Iap2LinkChannel(stream, name = "iap2-bt") { line -> log(line) }
+        activeChannel = channel
+        BtSessionGate.inboundActive = true
         try {
-            if (!running) return
-            val stream =
-                StreamDuplexStream(socket.inputStream, socket.outputStream) {
-                    runCatching { socket.close() }
-                }
-            val link = Iap2LinkChannel(stream, name = "iap2-bt") { line -> log(line) }
-            channel = link
-            activeChannel = link
-            link.runSenderSession(context, SESSION_TIMEOUT_MILLIS, log, onEndpoint, onWifiCredentials, onEndpointUpdate)
+            channel.runSenderSession(context, SESSION_TIMEOUT_MILLIS, log, onEndpoint, onWifiCredentials, onEndpointUpdate)
         } catch (error: IOException) {
             log("SESSION 失败: ${error.message}")
         } finally {
             activeChannel = null
-            channel?.close()
-            runCatching { socket.close() }
-            BtSessionGate.connections.endInbound(accepted)
+            BtSessionGate.inboundActive = false
+            channel.close()
             log("SESSION 结束，等待接收端重连（BT 监听仍在运行）")
         }
     }

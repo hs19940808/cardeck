@@ -273,7 +273,7 @@ class WifiCarPlayConnector(
                     boundNetwork.set(network)
                     val bound = connectivityManager.bindProcessToNetwork(network)
                     log("WiFi: 已绑定当前WiFi网络 $network bindProcessToNetwork=$bound")
-                    if (reported.compareAndSet(false, true)) onResult(true)
+                    if (reported.compareAndSet(false, true)) onResult(bound)
                 }
 
                 override fun onUnavailable() {

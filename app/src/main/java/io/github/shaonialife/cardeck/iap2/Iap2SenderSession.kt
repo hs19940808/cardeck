@@ -5,6 +5,20 @@ import java.io.IOException
 import java.security.SecureRandom
 
 /**
+ * 真车系接收端特征（0x1D01 name/model/manufacturer 子串，小写比对）。
+ *
+ * `mazda` / `yanfeng` 来自 smartBox-933C（0x1D01 身份 `smartBox-933C` / `Mazda DA` /
+ * `Yanfeng Visteon(Chongqing)…`，即冒充马自达 DA 车机的有线转无线盒子）：
+ * 2026-10-21 22:29 实测它收到 32B 挑战后 **0.1 秒直接断链**（与奥迪 MMI 6318 同族处置），
+ * 属于「真车系只要 20B」，不能按测试台的 32B 基线先试。
+ */
+private val LEGACY_RECEIVER_MARKERS = listOf("audi", "delphi", "mib", "harman", "porsche", "mazda", "yanfeng")
+
+/** 接收端是否属于「20B 首试」的真车系（纯函数，便于单测）。 */
+internal fun prefersTwentyByteChallenge(identityText: String): Boolean =
+    LEGACY_RECEIVER_MARKERS.any { identityText.contains(it) }
+
+/**
  * iAP2 发送端（iPhone 角色）控制会话：完整走通无线 CarPlay 的 bring-up 序列，
  * 最终从 0x5703 / 0x4301 解析出接收端热点与 AirPlay 端点 —— Phase 1 的 Go/No-Go 交付。
  *
@@ -147,9 +161,6 @@ class Iap2SenderSession(
 
         /** 挑战档位（长度, 首次试探窗口）：顺序与窗口由 DiPlay/Audi 双端实测决定。 */
         private val MFI_ATTEMPTS = listOf(32 to 3_000L, 20 to 6_000L, 16 to 3_000L)
-
-        /** 真车系接收端特征（0x1D01 name/model/manufacturer 子串，小写比对）。 */
-        private val LEGACY_RECEIVER_MARKERS = listOf("audi", "delphi", "mib", "harman", "porsche")
     }
 
     /** 从 0x1D01 提取接收端身份文本（name/model/manufacturer 小写拼接）——MFi 挑战长度选择用。 */
@@ -182,17 +193,21 @@ class Iap2SenderSession(
 
         // ---- MFi（跳过校验：0xAA05 自报成功）----
         val identityText = identityText(identification)
-        val legacyCar = LEGACY_RECEIVER_MARKERS.any { identityText.contains(it) }
+        val legacyCar = prefersTwentyByteChallenge(identityText)
+        if (legacyCar) {
+            log("iap2 识别为真车系/车机系盒子（$identityText）——MFi 首选 20B（真车实录长度；32B 会被它直接断链）")
+        }
         send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
         val certificate = expect(Iap2MessageIds.MFI_CERTIFICATE, deadline)
         log("iap2 rx=0xaa01 certificate bytes=${certificate.body.size}（跳过校验）")
-        val keyType = MfiCertificateHint.fromBody(certificate.body)
-        val prefer20First = keyType?.let { it.challengeBytes == 20 } ?: legacyCar
-        log(
-            "iap2 MFi 证书公钥=${keyType?.name ?: "未知"}，基线首选 ${if (prefer20First) 20 else 32}B" +
-                "（已成功的车机记忆优先，保留 20B/32B 回退）",
-        )
-        runMfiChallenge(deadline, prefer20First = prefer20First, receiverKey = identityText)
+        // 挑战长度按接收端身份选择（2026-10-11 奥迪字节级实测修正）：
+        //  - 真车系（Audi/Delphi MIB 等）：**20B 首试**。真 iPhone 实录（carplay-wifi-extractor
+        //    client）与 catplay 发送端都用 20B；奥迪对 20B 秒答。32B 先行会导致车机
+        //    ACK 挑战帧后**整段静默**（不回 ACK、不回应答，会话变僵尸）——本日多轮实测，
+        //    32B→20B 的会话全部卡死，20B→（记忆命中）的会话全部秒通。
+        //  - 测试台 DiPlay（Carlinkit AuthV3 EC 身份）：**只接受精确 32B**，长度不符直接断链。
+        // 全部无应答也不中止——我们不校验签名（0xAA05 自报），由 0x5702 是否应答判定放行。
+        runMfiChallenge(deadline, prefer20First = legacyCar, receiverKey = identityText)
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 authentication-succeeded（自报）")
 
@@ -514,16 +529,9 @@ class Iap2SenderSession(
                 val frame = recvFrame(remaining)
                 if (frame == null) {
                     if (!channel.isAlive) {
-                        // 断链可能由长度不兼容或蓝牙干扰造成，不能写成对端明确拒绝。
-                        // 保留既有降级记忆供下一条新链路换档，本链路已死，不能再发 0xAA05。
+                        log("iap2 MFi 挑战期间链路断开（${size}B，对端不接受该长度）——记入该车机被拒档位")
                         MfiLengthMemory.recordRejected(context, receiverKey, size)
-                        val nextOrder =
-                            MfiLengthMemory.orderAttempts(baselineLengths, MfiLengthMemory.load(context, receiverKey))
-                        log(
-                            "iap2 MFi ${size}B 挑战期间链路断开（原因未确认）" +
-                                "——下次重连优先 ${nextOrder.first()}B",
-                        )
-                        throw IOException("iAP2 MFi ${size}B 挑战期间链路断开，等待重连后重试")
+                        return
                     }
                     continue
                 }
@@ -607,12 +615,9 @@ class Iap2SenderSession(
     private fun expect(
         messageId: Int,
         deadline: Long,
-    ): Iap2Csm.Frame {
-        val frame = expectOrNull(messageId, deadline)
-        if (frame != null) return frame
-        val outcome = if (channel.isAlive) "超时" else "期间链路断开"
-        throw IOException("等待 0x${messageId.toString(16)} $outcome")
-    }
+    ): Iap2Csm.Frame =
+        expectOrNull(messageId, deadline)
+            ?: throw IOException("等待 0x${messageId.toString(16)} 超时")
 
     /**
      * 同 [expect]，但超时返回 null（用于可选消息）。非预期帧进暂存区供后续消费。

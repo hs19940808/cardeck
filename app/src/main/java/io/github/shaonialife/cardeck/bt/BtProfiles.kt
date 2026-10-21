@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -16,8 +17,9 @@ import java.util.concurrent.atomic.AtomicReference
  * 奥迪 MIB3 实测（2026-10-18，用户报告）：手机与车机处于蓝牙**已连接**状态
  * （HFP 通话 / A2DP 媒体配置文件在线）时，车机不开放无线 CarPlay 的 iAP2 服务
  * 窗口——表现为 `BT-C: 连接失败（车机未就绪或不在无线配对窗口）` 每 3 秒重试。
- * 该策略仅用于已确认提供 …caff 服务的出站连接准备；主动回连的转换盒可能依赖
- * HFP 触发启动，不能在配对成功回调里无条件断开。入站一到，调用方应立即停止此处操作。
+ * 真 iPhone 的无线 CarPlay 也不依赖这些配置文件：控制通道走 iAP2 RFCOMM（独立
+ * SDP 服务），声音走 WiFi 上的 AirPlay。因此正确形态是：**系统级配对 + iAP2
+ * RFCOMM，其余配置文件不连**；该策略仅适用于提供配件端 iAP2 服务的设备。
  *
  * 实现说明：`BluetoothHeadset/A2dp/LeAudio.disconnect(BluetoothDevice)` 是
  * **@SystemApi**——编译期不可见，但运行时注解只要求 `BLUETOOTH_CONNECT`
@@ -68,16 +70,16 @@ object BtProfiles {
         }
 
     /**
-     * 尽力断开该设备的全部配置文件连接。
+     * 对提供配件端 iAP2 服务的设备尽力断开配置文件连接。
      *
-     * @return 断开前在线的配置文件（空 = 本来就没连接，无需任何动作）
+     * 部分无线盒子只主动回连手机，未声明配件端服务时不能直接套用奥迪的断开策略。
+     *
+     * @return 执行断开前在线的配置文件；没有执行断开时返回空列表。
      */
     fun disconnect(
         context: Context,
         device: BluetoothDevice,
-        shouldContinue: () -> Boolean = { true },
     ): List<String> {
-        if (!shouldContinue()) return emptyList()
         val address =
             try {
                 device.address
@@ -86,19 +88,40 @@ object BtProfiles {
             }
         val before = connectedNames(context, address)
         if (before.isEmpty()) return emptyList()
-        for (id in profiles) {
-            if (!shouldContinue()) return before
-            if (profileName(id) !in before) continue
-            proxy(context, id)?.let { if (shouldContinue()) disconnectProfile(it, device) }
+        val services =
+            try {
+                device.uuids?.map { it.uuid }
+            } catch (_: SecurityException) {
+                return emptyList()
+            }
+        if (!shouldDisconnectProfiles(services, BtSessionGate.inboundActive || BtSessionGate.sessionActive)) {
+            return emptyList()
         }
-        if (!awaitDisconnected(context, address, 1_500L, shouldContinue) && shouldContinue()) {
+        for (id in profiles) {
+            if (profileName(id) !in before) continue
+            proxy(context, id)?.let { disconnectProfile(it, device) }
+        }
+        if (!awaitDisconnected(context, address, 1_500L) &&
+            !BtSessionGate.inboundActive && !BtSessionGate.sessionActive
+        ) {
             // 配置级断开未生效（个别 ROM 限流）：设备级断开兜底（@hide，同样只要求
             // BLUETOOTH_CONNECT）。车载/耳机当前连接的设备可能被一并断开，属预期。
             runCatching { BluetoothDevice::class.java.getMethod("disconnect").invoke(device) }
-            awaitDisconnected(context, address, 500L, shouldContinue)
+            awaitDisconnected(context, address, 500L)
         }
         return before
     }
+
+    /**
+     * 已知不提供配件端服务时保留音频连接，避免妨碍盒子主动回连。
+     * 服务表缺失时维持原有探测行为；已建立的 iAP2 会话始终优先。
+     */
+    internal fun shouldDisconnectProfiles(
+        services: List<UUID>?,
+        sessionActive: Boolean,
+    ): Boolean =
+        !sessionActive &&
+            (services.isNullOrEmpty() || Iap2BluetoothClient.ACCESSORY_IAP2_UUID in services)
 
     /** 断开后仍在线的配置文件（用于日志判断是否真的断开）。 */
     fun stillConnected(
@@ -110,11 +133,9 @@ object BtProfiles {
         context: Context,
         address: String,
         timeoutMillis: Long,
-        shouldContinue: () -> Boolean,
     ): Boolean {
         val deadline = SystemClock.uptimeMillis() + timeoutMillis
         while (SystemClock.uptimeMillis() < deadline) {
-            if (!shouldContinue()) return false
             if (connectedNames(context, address).isEmpty()) return true
             try {
                 Thread.sleep(120)

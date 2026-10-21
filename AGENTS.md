@@ -330,6 +330,13 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   **注意**：广播提前后首注册可能赶上 Shizuku 未就绪 → TXT id 写成占位 MAC，
   而车机按该 id 匹配手机（占位 = 永不邀请）。`DeviceIdentity.bluetoothMac(forceRetry)`
   + `CarPlayCtrlAdvertiser.repairPlaceholderMac`（每 2s 重试、成功即重注册）是必需兜底。
+- **已连热点时 ctrl 邀请也必须有连接入口**（2026-10-21 smartBox 上车日志）：蓝牙未交接
+  0x5703/0x4301 时，盒子仍可能经 WiFi 发 `GET /ctrl-int/1/connect`。只计数回 200、
+  等蓝牙回调后才检查邀请，会导致一直停在蓝牙失败。0.1.13 补上邀请入口：仅当已选
+  设备名称与当前 SSID 相同、收包本地地址仍属于绑定 WiFi，才复用 AirPlay 流程；
+  mDNS 与重试端点限定为邀请来源。已有蓝牙握手、配对或推流时不另起会话，取消与
+  重连使旧任务失效。广播重注册也调用 `stop()`，不能在这里清零已收到的邀请计数。
+  单测/构建只验证软件入口；盒子实际握手与显示须另行装机验证。
 - **配对/推流期间绝不能断 BT 控制会话**（2026-10-16 定谳，「连上约 3 秒即断」循环根因）：
   DiPlay 在 WiFi 隧道 iAP2 就绪前（AirPlay 通道从未下发 `disableBluetooth`，
   `handoffRequested=false`）看到 RFCOMM 断开即判 `wireless bring-up failed` →
@@ -359,6 +366,13 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   挪进 Shizuku UserService（曾试过，不可行）：UserService 里
   `BluetoothManager.getAdapter()` 返回 null（无主 Looper 的应用上下文），查询恒为
   「未连接」，反而掩盖真实状态。诊断日志：`BT-PROFILE: 连接前…的蓝牙配置文件状态=`。
+- **无线盒子的音频连接按服务能力处理**（2026-10-21，魅族 20 Pro + smartBox 系列盒子）：
+  选定目标也不能无条件套用上述奥迪策略。`BtProfiles.disconnect` 在服务表已知且不含
+  配件端 iAP2 UUID（…caff）时保留既有音频连接；服务表未知时保留原有探测行为。
+  已有入站 iAP2 / CarPlay 会话时不主动拆配置文件，设备级断开兜底也要复查会话状态。
+  本次已装机验证「通话连接在启动 CarDeck 后保持」，**完整 CarPlay 连接尚未验收**：
+  用户的盒子只接电脑/电源供电，未接车机。转换盒的热点/管理页可在维护供电下工作，
+  不能凭它们可访问就判定车机侧有线 CarPlay 数据链路已就绪；完整验收须接车机数据口。
 - **Shell 命令**：参数用 `shellQuote`（单引号转义）；查 WiFi 开关/当前 SSID 用一次
   `cmd wifi status`（勿用「任意 WiFi 即成功」的盲绑判定——手机连着别的 WiFi 时会误判）。
   **无互联网热点：默认走应用专属网络，不再系统级入网**（2026-10-18 定谳）：

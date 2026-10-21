@@ -27,6 +27,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.DrawableCompat
+import io.github.shaonialife.cardeck.bt.BtProfiles
 import io.github.shaonialife.cardeck.bt.TargetDevicePrefs
 import io.github.shaonialife.cardeck.input.TouchRouter
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
@@ -1650,8 +1651,28 @@ class MainActivity : AppCompatActivity() {
                 // 先关弹窗再提示：snackbar 在 Activity 窗口内，弹窗未关时会被盖住
                 dialog.dismiss()
                 setTarget(device, name)
-                // 配对回调尚不知设备的 iAP2 方向，不再无条件断 HFP/A2DP。
-                // 出站客户端确认 …caff 后再执行奥迪兼容策略，并服从入站会话门闸。
+                // 「只配对、不连接」：系统/车机在配对完成后常会自动建立 HFP/A2DP
+                // 连接，而奥迪实测这种「已连接」状态会让车机拒绝 CarPlay。立即与
+                // 1.5s 后各断一次（车机侧重连通常在这两个时间点之间发生）。
+                val app = applicationContext
+                Bg.run("bt-pair-only") {
+                    repeat(2) { attempt ->
+                        val dropped = BtProfiles.disconnect(app, device)
+                        if (dropped.isNotEmpty()) {
+                            log(
+                                "BT-PAIR: 已断开配对后自动建立的 ${dropped.joinToString("/")} 连接" +
+                                    "（保持仅配对，避免车机拒绝 CarPlay）",
+                            )
+                        }
+                        if (attempt == 0) {
+                            try {
+                                Thread.sleep(1_500)
+                            } catch (_: InterruptedException) {
+                                return@run
+                            }
+                        }
+                    }
+                }
             }
 
             BluetoothDevice.BOND_NONE -> {
