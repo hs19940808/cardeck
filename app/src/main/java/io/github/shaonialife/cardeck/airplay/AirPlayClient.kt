@@ -8,7 +8,9 @@ import io.github.shaonialife.cardeck.audio.AudioSender
 import io.github.shaonialife.cardeck.audio.AudioTuning
 import io.github.shaonialife.cardeck.iap2.Iap2Csm
 import io.github.shaonialife.cardeck.iap2.Iap2MessageIds
+import io.github.shaonialife.cardeck.iap2.Iap2NowPlayingSession
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
+import io.github.shaonialife.cardeck.input.ControllerReports
 import io.github.shaonialife.cardeck.net.EndpointHosts
 import io.github.shaonialife.cardeck.util.DeviceIdentity
 import java.io.IOException
@@ -429,6 +431,12 @@ class AirPlayClient(
     private fun isSessionAlive(): Boolean = socket?.isClosed == false
 
     fun close() {
+        synchronized(eventCommandLock) {
+            runCatching { eventCommandSocket?.close() }
+            eventCommandSocket = null
+            eventCommandCipher = null
+            pendingModeCommands.clear()
+        }
         runCatching { socket?.close() }
         socket = null
         activeHost = null
@@ -444,6 +452,7 @@ class AirPlayClient(
         failAllPending("控制通道关闭")
         runCatching { iapTunnel?.socket?.close() }
         iapTunnel = null
+        iapLink?.close()
         iapLink = null
         // 注意：controlIapTx 不在这里 shutdown——close() 会被同实例的重试路径
         // （retryWithPairing 等）复用，杀掉执行器会废掉重连后的 MIB3 出站；
@@ -490,6 +499,7 @@ class AirPlayClient(
 
     private val eventCommandLock = Any()
     private var eventCseq = 0
+    private val pendingModeCommands = LinkedHashSet<String>()
 
     /** 未知请求（非 /command 的合法请求）累计数：前 10 条留痕后静默。 */
     @Volatile
@@ -512,16 +522,20 @@ class AirPlayClient(
         socket: Socket,
         cipher: ControlCipher?,
     ) {
-        eventCommandSocket = socket
-        eventCommandCipher = cipher
+        synchronized(eventCommandLock) {
+            runCatching { eventCommandSocket?.close() }
+            pendingModeCommands.clear()
+            eventCommandSocket = socket
+            eventCommandCipher = cipher
+        }
     }
 
     /** 在事件通道上发 POST /command（通道加密时加密）。通道未就绪时返回 false。 */
     fun postEventCommand(command: Map<String, Any?>): Boolean {
-        val socket = eventCommandSocket ?: return false
-        val cipher = eventCommandCipher
         return try {
             synchronized(eventCommandLock) {
+                val socket = eventCommandSocket ?: return false
+                val cipher = eventCommandCipher
                 eventCseq++
                 val body = BinaryPlist.encode(command)
                 val head =
@@ -534,6 +548,10 @@ class AirPlayClient(
                 socket.getOutputStream().apply {
                     write(bytes)
                     flush()
+                }
+                if (command["type"] == "modesChanged") {
+                    pendingModeCommands.add(eventCseq.toString())
+                    if (pendingModeCommands.size > 32) pendingModeCommands.remove(pendingModeCommands.first())
                 }
             }
             true
@@ -582,30 +600,42 @@ class AirPlayClient(
         return head.toByteArray(Charsets.US_ASCII) + body
     }
 
-    /** 声明当前资源快照；初始在屏幕 SETUP 前发送，之后跟随车机交接更新。 */
+    /** 资源通知与 HID 命令同走事件通道；控制连接的 HTTP 200 不代表车机处理了切屏。 */
     fun assertModes(): Boolean {
         val snapshot = modes.snapshot()
-        val body =
-            BinaryPlist.encode(
+        val sent =
+            postEventCommand(
                 linkedMapOf(
                     "type" to "modesChanged",
                     "params" to snapshot,
                 ),
             )
-        return try {
-            val (statusLine, _) =
-                request(
-                    "POST",
-                    "/command",
-                    body,
-                    contentType = "application/x-apple-binary-plist",
-                )
-            log("AIRPLAY: modesChanged [$statusLine] params=$snapshot")
-            statusLine.contains("200")
-        } catch (error: IOException) {
-            log("AIRPLAY: modesChanged 失败 - ${error.message}")
-            false
-        }
+        log("AIRPLAY: modesChanged(事件通道) 已发送=$sent params=$snapshot")
+        return sent
+    }
+
+    /** 仅记录资源通知的对应应答，不回应应答，也不阻塞事件读取等待另一条连接。 */
+    private fun recordModeResponse(
+        head: String,
+        firstLine: String,
+        body: ByteArray,
+    ) {
+        val cseq = CSEQ_REGEX.find(head)?.groupValues?.get(1) ?: return
+        val pending = synchronized(eventCommandLock) { pendingModeCommands.remove(cseq) }
+        if (!pending) return
+        val result =
+            if (body.isEmpty()) {
+                "空体"
+            } else {
+                runCatching {
+                    BinaryPlist
+                        .parseRecovered(body)
+                        .value
+                        .toString()
+                        .take(400)
+                }.getOrElse { "无法解析(${body.size}B)" }
+            }
+        log("EVENT: modesChanged 应答 CSeq=$cseq [$firstLine] body=$result")
     }
 
     /**
@@ -680,6 +710,12 @@ class AirPlayClient(
         var infoRoot: Map<*, *>? = null
         val infoMap = loadInfoWithDiagnostics()
         infoRoot = infoMap
+        // /info.modes 是原车的初始资源请求，不能把仍显示原车界面的状态直接声明成手机占屏。
+        if (infoMap?.containsKey("modes") == true) {
+            val initialModes = infoMap["modes"] as? Map<*, *>
+            val response = modes.change(initialModes)
+            log("AIRPLAY: 初始资源请求 params=$initialModes → response=$response")
+        }
         val display = (infoMap?.get("displays") as? List<*>)?.firstOrNull() as? Map<*, *>
         if (display == null) {
             log(
@@ -1283,6 +1319,10 @@ class AirPlayClient(
      */
     var onMediaKey: ((Int) -> Unit)? = null
 
+    /** 旋钮/导航键既可能直走 hidSendReport，也可能封装在 iAP2 中。 */
+    internal var onControllerInput: ((ControllerReports.Report) -> Unit)? = null
+    internal var nowPlayingProvider: (() -> Iap2NowPlayingSession.Snapshot?)? = null
+
     /** 虚拟链路唯一实例（出站路由/三形态语义见 [VirtualIap2Link]）。 */
     private fun obtainIapLink(): VirtualIap2Link =
         iapLink ?: synchronized(this) {
@@ -1295,6 +1335,8 @@ class AirPlayClient(
                     alive = { socket?.isClosed == false },
                 ).also {
                     it.onMediaKey = { keyCode -> onMediaKey?.invoke(keyCode) }
+                    it.onControllerInput = { report -> onControllerInput?.invoke(report) }
+                    it.nowPlayingProvider = { nowPlayingProvider?.invoke() }
                     it.begin()
                     iapLink = it
                 }
@@ -2107,9 +2149,11 @@ class AirPlayClient(
                         var eventOtherLogged = 0
                         for (message in accumulator.offer(plain)) {
                             val firstLine = message.firstLine
-                            // (a) 状态行（"RTSP/1.0 200 OK" 等）= 车机对**我们命令**的应答：
-                            //     静默跳过——不回、不记录（回应答会触发乒乓回声，见 respondEventRequest）
-                            if (firstLine.startsWith("RTSP/") || firstLine.startsWith("HTTP/")) continue
+                            // 状态行是车机对我们命令的应答；仅记录资源通知结果，绝不回包。
+                            if (firstLine.startsWith("RTSP/") || firstLine.startsWith("HTTP/")) {
+                                recordModeResponse(message.head, firstLine, message.body)
+                                continue
+                            }
                             // (b) 请求判定：方法 token + "/"-开头路径。畸形行（如 "OK 200 OK"：
                             //     第 2 token 是数字）判为非请求 → 静默丢弃，不回不记
                             val tokens = firstLine.split(" ")
@@ -2171,7 +2215,7 @@ class AirPlayClient(
                                 if (response["status"] == 0L) assertModes()
                                 continue
                             }
-                            // requestUI 的 ACK 不等待 Shell 启动应用；资源交接走控制通道。
+                            // requestUI 的 ACK 不等待 Shell 启动应用；资源通知仍走当前事件通道。
                             respondEventRequest(cseq)
                             if (command["type"] == "requestUI" && CarPlayUiRequest.from(command) != null) {
                                 modes.takeScreen()

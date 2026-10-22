@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.util.Log
+import io.github.shaonialife.cardeck.input.CarFocusNavigation
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.util.DebugFileLog
 
@@ -18,6 +19,7 @@ import io.github.shaonialife.cardeck.util.DebugFileLog
 class SenderApp : Application() {
     override fun onCreate() {
         super.onCreate()
+        CarFocusNavigation.install(this)
         // 会话日志起点标记：日志文件跨进程累积（2MB 上限），导出默认只取本次启动
         // 之后的部分。必须在这里写（Application 是进程最早入口），晚于任何业务日志
         // 都会让它被算进「历史」。

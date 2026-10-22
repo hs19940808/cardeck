@@ -1,5 +1,7 @@
 package io.github.shaonialife.cardeck.iap2
 
+import io.github.shaonialife.cardeck.input.ControllerReports
+import io.github.shaonialife.cardeck.input.Iap2HidSession
 import io.github.shaonialife.cardeck.transport.Iap2LinkChannel
 import java.io.IOException
 import java.security.SecureRandom
@@ -15,8 +17,7 @@ import java.security.SecureRandom
 private val LEGACY_RECEIVER_MARKERS = listOf("audi", "delphi", "mib", "harman", "porsche", "mazda", "yanfeng")
 
 /** 接收端是否属于「20B 首试」的真车系（纯函数，便于单测）。 */
-internal fun prefersTwentyByteChallenge(identityText: String): Boolean =
-    LEGACY_RECEIVER_MARKERS.any { identityText.contains(it) }
+internal fun prefersTwentyByteChallenge(identityText: String): Boolean = LEGACY_RECEIVER_MARKERS.any { identityText.contains(it) }
 
 /**
  * iAP2 发送端（iPhone 角色）控制会话：完整走通无线 CarPlay 的 bring-up 序列，
@@ -83,6 +84,31 @@ class Iap2SenderSession(
     )
 
     private val parser = Iap2Csm.Parser()
+    private val hid = Iap2HidSession(log)
+    private val nowPlaying = Iap2NowPlayingSession({ nowPlayingProvider() })
+
+    /** 与车机桌面共享的只读媒体快照。 */
+    internal var nowPlayingProvider: () -> Iap2NowPlayingSession.Snapshot? = { null }
+
+    /** 蓝牙控制通道的 HID 输入；其生命周期与本次 RFCOMM 会话一致。 */
+    internal var onControllerInput: ((ControllerReports.Report) -> Unit)?
+        get() = hid.onControllerInput
+        set(value) {
+            hid.onControllerInput = value
+        }
+
+    /** 已按组件描述符解出的媒体键，与 Wi-Fi HID 采用同样的边沿和长按语义。 */
+    internal var onMediaKey: ((Int) -> Unit)?
+        get() = hid.onMediaKey
+        set(value) {
+            hid.onMediaKey = value
+        }
+
+    /** 握手失败或断链时同时释放输入与媒体订阅。 */
+    internal fun releaseControlState() {
+        hid.close()
+        nowPlaying.close()
+    }
 
     /** 刚解析、尚未分类的帧（到达顺序）。 */
     private val receivedFrames = ArrayDeque<Iap2Csm.Frame>()
@@ -395,35 +421,63 @@ class Iap2SenderSession(
         // 逐条打日志会把文件日志撑爆（文件超 2MB 直接删，等于丢掉真正有用的上下文）。
         var lastLoggedId = -1
         var repeatCount = 0
-        while (true) {
-            val frame = recvFrame(30_000L)
-            if (frame == null) {
-                if (!channel.isAlive) break
-                continue
-            }
-            // 生命周期消息必须先于日志限流处理：0x4301 可能作为「车机刚打开 CarPlay
-            // 窗口」的晚信号在 Phase 1 之后才到。若跟着限流逻辑走，它要么被当成
-            // keep-alive 只记长度，要么因与上一条同 ID 被 continue 掉——两种都等于
-            // 丢弃（2026-10-18 Audi MMI 9310「连上后 15 秒自动断开」的根因）。
-            if (frame.messageId == Iap2MessageIds.CARPLAY_START_SESSION) {
-                handleLateStartSession(frame)
-            }
-            if (frame.messageId == lastLoggedId) {
-                repeatCount++
-                if (repeatCount % 100 != 0) continue
-            } else {
-                if (repeatCount >= 99) {
-                    log("iap2 上一条 0x${lastLoggedId.toString(16)} 重复 ${repeatCount + 1} 次（同类已限流）")
+        try {
+            while (true) {
+                nowPlaying.poll()?.let { send(Iap2MessageIds.NOW_PLAYING_UPDATE, it) }
+                val frame = recvFrame(1_000L)
+                if (frame == null) {
+                    if (!channel.isAlive) break
+                    continue
                 }
-                lastLoggedId = frame.messageId
-                repeatCount = 0
+                // 生命周期消息必须先于日志限流处理：0x4301 可能作为「车机刚打开 CarPlay
+                // 窗口」的晚信号在 Phase 1 之后才到。若跟着限流逻辑走，它要么被当成
+                // keep-alive 只记长度，要么因与上一条同 ID 被 continue 掉——两种都等于
+                // 丢弃（2026-10-18 Audi MMI 9310「连上后 15 秒自动断开」的根因）。
+                if (frame.messageId == Iap2MessageIds.CARPLAY_START_SESSION) {
+                    handleLateStartSession(frame)
+                }
+                if (handleHidFrame(frame)) continue
+                if (handleNowPlayingFrame(frame)) continue
+                if (frame.messageId == lastLoggedId) {
+                    repeatCount++
+                    if (repeatCount % 100 != 0) continue
+                } else {
+                    if (repeatCount >= 99) {
+                        log("iap2 上一条 0x${lastLoggedId.toString(16)} 重复 ${repeatCount + 1} 次（同类已限流）")
+                    }
+                    lastLoggedId = frame.messageId
+                    repeatCount = 0
+                }
+                log(
+                    "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +
+                        "(${Iap2MessageIds.nameOf(frame.messageId)}) keep-alive bytes=${frame.body.size}",
+                )
             }
-            log(
-                "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +
-                    "(${Iap2MessageIds.nameOf(frame.messageId)}) keep-alive bytes=${frame.body.size}",
-            )
+        } finally {
+            releaseControlState()
+            log("SESSION 保活结束（链路断开）")
         }
-        log("SESSION 保活结束（链路断开）")
+    }
+
+    /** HID 在保活日志限流之前消费，StartHID 应答回传实际组件编号。 */
+    private fun handleHidFrame(frame: Iap2Csm.Frame): Boolean {
+        if (!hid.handle(frame)) return false
+        if (frame.messageId == Iap2MessageIds.START_HID) {
+            val component = Iap2HidSession.componentId(Iap2Csm.parseParams(frame.body)) ?: 0
+            send(Iap2MessageIds.DEVICE_HID_REPORT, Iap2Csm.u16(0, component), Iap2Csm.param(1, byteArrayOf(0)))
+        }
+        return true
+    }
+
+    /** 订阅在收到时立即应答，后续变化由保活泵的一秒节拍推送。 */
+    private fun handleNowPlayingFrame(frame: Iap2Csm.Frame): Boolean {
+        if (frame.messageId != Iap2MessageIds.START_NOW_PLAYING_UPDATES &&
+            frame.messageId != Iap2MessageIds.STOP_NOW_PLAYING_UPDATES
+        ) {
+            return false
+        }
+        nowPlaying.handle(frame)?.let { send(Iap2MessageIds.NOW_PLAYING_UPDATE, it) }
+        return true
     }
 
     /**
@@ -679,19 +733,17 @@ class Iap2SenderSession(
             when (frame.messageId) {
                 Iap2MessageIds.START_HID -> {
                     log("iap2 rx=0x6800 start-hid bytes=${frame.body.size}")
-                    send(
-                        Iap2MessageIds.DEVICE_HID_REPORT,
-                        Iap2Csm.u16(0, 0),
-                        Iap2Csm.param(1, byteArrayOf(0)),
-                    )
+                    handleHidFrame(frame)
                     return
                 }
 
                 else ->
-                    log(
-                        "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +
-                            "(${Iap2MessageIds.nameOf(frame.messageId)})",
-                    )
+                    if (!handleHidFrame(frame) && !handleNowPlayingFrame(frame)) {
+                        log(
+                            "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +
+                                "(${Iap2MessageIds.nameOf(frame.messageId)})",
+                        )
+                    }
             }
         }
     }

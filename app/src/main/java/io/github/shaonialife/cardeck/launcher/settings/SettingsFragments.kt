@@ -609,16 +609,18 @@ class DisplayPanelFragment : SettingsPanelFragment() {
                     fromUser: Boolean,
                 ) {
                     if (!fromUser) return
-                    scaleValue.text = "${percentOf(progress)}%"
+                    val percent = percentOf(progress)
+                    scaleValue.text = "$percent%"
+                    // 方向键调节不会触发 onStopTrackingTouch，必须在值变化时保存。
+                    DisplayPrefs.setScalePercent(ctx, percent)
+                    refreshScaleNote()
                 }
 
                 override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
 
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {
                     val percent = percentOf(scaleSeek.progress)
-                    DisplayPrefs.setScalePercent(ctx, percent)
                     hostToast("分辨率 $percent% 已保存，下次连接起效")
-                    refreshScaleNote()
                 }
             },
         )

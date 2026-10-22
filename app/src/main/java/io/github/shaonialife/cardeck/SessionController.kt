@@ -17,12 +17,17 @@ import io.github.shaonialife.cardeck.bt.TargetDevicePrefs
 import io.github.shaonialife.cardeck.capture.HiddenDisplaySource
 import io.github.shaonialife.cardeck.iap2.Iap2MessageIds
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
+import io.github.shaonialife.cardeck.input.CarKeys
 import io.github.shaonialife.cardeck.input.ConsumerKeys
+import io.github.shaonialife.cardeck.input.ControllerReports
+import io.github.shaonialife.cardeck.input.HidKeyState
+import io.github.shaonialife.cardeck.input.HidReportCommand
 import io.github.shaonialife.cardeck.input.TouchReports
 import io.github.shaonialife.cardeck.input.TouchRouter
 import io.github.shaonialife.cardeck.launcher.VirtualLauncher
 import io.github.shaonialife.cardeck.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
+import io.github.shaonialife.cardeck.media.readIap2NowPlaying
 import io.github.shaonialife.cardeck.net.AirPlayFeatures
 import io.github.shaonialife.cardeck.net.CarPlayCtrlAdvertiser
 import io.github.shaonialife.cardeck.net.CarPlayCtrlInvite
@@ -133,6 +138,7 @@ object SessionController {
         AppOrientationCompat.diagSink = ::appendLog
         // 主线程调用 shell 的告警（历史上两次真机 ANR 都源于此；HKS 下 logcat 不可读）
         Shell.violationSink = ::appendLog
+        CarKeys.attach(context.applicationContext, ::appendLog)
     }
 
     /** 追加一行日志：logcat + 文件 + 进程级缓冲 + 挂屏渲染（增量行直送）。任意线程可调。 */
@@ -274,7 +280,7 @@ object SessionController {
                     val opened = openCarPlayUi(context, target)
                     if (currentClient === client && !client.cancelled && !connectCancelled) {
                         val keyFrame = videoSender?.requestKeyFrame() == true
-                        appendLog("EVENT: requestUI $target → 页面唤起=$opened，关键帧请求=$keyFrame")
+                        appendLog("EVENT: requestUI $target → 手机虚拟屏页面切换=$opened，关键帧请求=$keyFrame")
                     }
                 } catch (error: Exception) {
                     appendLog("EVENT: requestUI $target 唤起失败 - ${error.message}")
@@ -432,7 +438,11 @@ object SessionController {
                     onWifiCredentials = wifiCredentialHook,
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "车机回连") },
                     targetProvider = targetProvider,
-                )
+                ).also {
+                    it.onControllerInput = ::onBluetoothControllerInput
+                    it.onMediaKey = ::onBluetoothMediaKey
+                    it.nowPlayingProvider = ::readIap2NowPlaying
+                }
             bluetoothClient =
                 Iap2BluetoothClient(
                     context,
@@ -441,7 +451,11 @@ object SessionController {
                     onWifiCredentials = wifiCredentialHook,
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "主动连车机") },
                     targetProvider = targetProvider,
-                )
+                ).also {
+                    it.onControllerInput = ::onBluetoothControllerInput
+                    it.onMediaKey = ::onBluetoothMediaKey
+                    it.nowPlayingProvider = ::readIap2NowPlaying
+                }
             ctrlAdvertiser =
                 CarPlayCtrlAdvertiser(context) { line -> appendLog(line) }.also {
                     it.onInvite = ::onCtrlInvite
@@ -530,6 +544,23 @@ object SessionController {
 
     /** 正常蓝牙握手已经在跑时，WiFi 邀请只作为其就绪信号，不另起兜底流程。 */
     private fun hasBtControlSession(): Boolean = BtSessionGate.inboundActive || bluetoothClient?.hasActiveSession == true
+
+    /** 蓝牙 HID 与事件/隧道输入共用按键队列，保持各连接来源独立。 */
+    private fun onBluetoothControllerInput(
+        source: String,
+        report: ControllerReports.Report,
+    ) {
+        if (!CarKeys.sessionActive || connectCancelled) return
+        CarKeys.keys("$source:${report.id}", report.keys, report.canceled)
+        if (report.wheel != 0) CarKeys.rotate(report.wheel)
+    }
+
+    /** 蓝牙保活中的媒体报告仅在当前投屏期间执行，断开后不控制手机播放器。 */
+    private fun onBluetoothMediaKey(keyCode: Int) {
+        if (!CarKeys.sessionActive || connectCancelled) return
+        dispatchMediaKey(keyCode)
+        appendLog("EVENT: 车机媒体键（蓝牙 iAP2）→ keyCode=$keyCode")
+    }
 
     /** 状态行文本（Activity 渲染 statusText 用）。 */
     fun statusLine(): String =
@@ -626,6 +657,7 @@ object SessionController {
 
     /** 会话结束/新周期开始前彻底退役上一代会话（旧管线泄漏会累积编码器/虚拟显示器，最终 dequeueBuffer -19）。 */
     fun retireSession() {
+        CarKeys.reset()
         pendingUiRequest.set(null)
         videoSender?.stop()
         videoSender = null
@@ -1817,11 +1849,27 @@ object SessionController {
                                 )
                             },
                         ).also { created ->
+                            created.nowPlayingProvider = ::readIap2NowPlaying
+                            val controllerState = HidKeyState()
+                            created.onControllerInput = { report ->
+                                if (currentClient === created && !created.cancelled && !connectCancelled && CarKeys.sessionActive) {
+                                    val changes = controllerState.update("iap:${report.id}", report.keys)
+                                    CarKeys.keys("iap:${report.id}", report.keys, report.canceled)
+                                    if (report.wheel != 0) CarKeys.rotate(report.wheel)
+                                    if (changes.isNotEmpty() || report.wheel != 0) {
+                                        appendLog(
+                                            "EVENT: 控制器（iAP2）keys=$changes wheel=${report.wheel}",
+                                        )
+                                    }
+                                }
+                            }
                             // 车机媒体键（iAP2 0x6802 通路）：方向盘/面板的上一曲、下一曲。
                             // 放在这里而不是调用点，保证重连重建 client 时也挂得上。
                             created.onMediaKey = { keyCode ->
-                                dispatchMediaKey(keyCode)
-                                appendLog("EVENT: 车机媒体键（iAP2 0x6802）→ keyCode=$keyCode 已注入")
+                                if (currentClient === created && !created.cancelled && !connectCancelled && CarKeys.sessionActive) {
+                                    dispatchMediaKey(keyCode)
+                                    appendLog("EVENT: 车机媒体键（iAP2 0x6802）→ keyCode=$keyCode 已注入")
+                                }
                             }
                         }
                     retireSession()
@@ -1925,12 +1973,37 @@ object SessionController {
                             currentSharedSecret = sessionKey
                             currentAudioHost =
                                 client.activeHost ?: EndpointHosts.candidates(client.currentEndpoint.ipAddresses).firstOrNull()
+                            val hidState = HidKeyState()
+                            val controllerLayouts = setup.hidDescriptors.mapValues { ControllerReports.fromDescriptor(it.value) }
+                            val mediaLayouts = setup.hidDescriptors.mapValues { ConsumerKeys.parseDescriptor(it.value) }
                             client.connectEventChannel(sessionKey, setup) commands@{ command ->
                                 if (currentClient !== client || client.cancelled || connectCancelled) return@commands
                                 when (command["type"]) {
                                     "hidSendReport" -> {
-                                        val uuid = command["uuid"]?.toString()
-                                        val report = command["hidReport"] as? ByteArray
+                                        if (!CarKeys.sessionActive) return@commands
+                                        val hid = HidReportCommand.from(command)
+                                        val uuid = hid?.uuid
+                                        val report = hid?.report
+                                        val controller = uuid?.let { controllerLayouts[it] }
+                                        if (controller != null && report != null) {
+                                            val input = controller.parse(report)
+                                            if (input == null) {
+                                                if (mediaLayouts[uuid] == null) {
+                                                    appendLog("EVENT: 控制器报告无效 uuid=$uuid bytes=${report.size}")
+                                                }
+                                            } else {
+                                                val changes = hidState.update("controller:$uuid:${input.id}", input.keys)
+                                                CarKeys.keys("controller:$uuid:${input.id}", input.keys)
+                                                if (input.wheel != 0) CarKeys.rotate(input.wheel)
+                                                if (changes.isNotEmpty() || input.wheel != 0) {
+                                                    appendLog(
+                                                        "EVENT: 控制器 uuid=$uuid keys=$changes wheel=${input.wheel}",
+                                                    )
+                                                }
+                                            }
+                                            // 一个描述符可包含多种 Application，媒体字段还要继续分流。
+                                            if (mediaLayouts[uuid] == null) return@commands
+                                        }
                                         // 车机媒体键（Consumer Control）走 hidSendReport 通路，
                                         // 判定**以设备描述符为准**（不按 uuid、不按车机型号写死）：
                                         // 描述符声明了 Consumer 页(0x0C)的设备才当媒体键，报告字节是
@@ -1939,23 +2012,29 @@ object SessionController {
                                         // DiPlay 的 knob(4B) 与 telephony(1B) 报告长度与媒体键重叠，
                                         // 只靠长度会误判（如 telephony usage 0xB3 会误发「快进」）。
                                         val descriptor = uuid?.let { setup.hidDescriptors[it] }
-                                        val keyMap =
-                                            descriptor?.let(ConsumerKeys::parseDescriptor)
+                                        val keyMap = uuid?.let { mediaLayouts[it] }
+                                        if (keyMap != null && report != null && !keyMap.accepts(report)) {
+                                            appendLog("EVENT: 媒体报告无效 uuid=$uuid bytes=${report.size}")
+                                            return@commands
+                                        }
                                         val rawValue =
                                             report
                                                 ?.takeIf { it.isNotEmpty() }
                                                 ?.let { it[0].toInt() and 0xFF }
-                                        val consumerUsage =
+                                        val consumerUsages =
                                             when {
                                                 // 有描述符：只有 Consumer 设备才解析（非 Consumer → null）
-                                                descriptor != null -> keyMap?.let { rawValue?.let(it::usageFor) }
+                                                descriptor != null -> keyMap?.usagesFor(report ?: ByteArray(0))
                                                 // 描述符缺失（未知车机）：保守回退——仅 1 字节报告，
                                                 // 值当 Usage ID 直读
-                                                report != null && report.size == 1 -> rawValue?.takeIf { it != 0 }
+                                                report != null && report.size == 1 -> listOfNotNull(rawValue?.takeIf { it != 0 })
                                                 else -> null
                                             }
                                         val contacts =
-                                            if (consumerUsage == null && report != null) {
+                                            if (consumerUsages == null &&
+                                                report != null &&
+                                                (descriptor == null || TouchReports.formatFromDescriptor(descriptor) != null)
+                                            ) {
                                                 // 触摸格式按设备描述符判定（Digitizer 页 + 单指/多槽），
                                                 // 描述符不可用时按报文长度回退——不依赖车机型号或 uuid
                                                 val touchFormat =
@@ -1964,21 +2043,35 @@ object SessionController {
                                             } else {
                                                 null
                                             }
-                                        if (consumerUsage != null) {
-                                            val keyCode = ConsumerKeys.keyCodeFor(consumerUsage)
-                                            if (keyCode != 0) {
-                                                dispatchMediaKey(keyCode)
-                                                appendLog(
-                                                    "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
-                                                        "（uuid=$uuid usage=0x%02x → keyCode=$keyCode）"
-                                                            .format(consumerUsage),
-                                                )
-                                            } else {
-                                                appendLog(
-                                                    "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
-                                                        "（uuid=$uuid usage=0x%02x）无对应 Android 键，忽略"
-                                                            .format(consumerUsage),
-                                                )
+                                        if (consumerUsages != null) {
+                                            val reportId = report?.let { keyMap?.reportId(it) } ?: 0
+                                            val changes = hidState.update("media:$uuid:$reportId", consumerUsages.toSet())
+                                            CarKeys.keys(
+                                                "media:$uuid:$reportId",
+                                                consumerUsages
+                                                    .mapNotNull {
+                                                        ControllerReports.navigationKeyCode(it).takeIf { key ->
+                                                            key != 0
+                                                        }
+                                                    }.toSet(),
+                                            )
+                                            val fresh = changes.filter { it.second && ControllerReports.navigationKeyCode(it.first) == 0 }
+                                            for ((consumerUsage, _) in fresh) {
+                                                val keyCode = ConsumerKeys.keyCodeFor(consumerUsage)
+                                                if (keyCode != 0) {
+                                                    dispatchMediaKey(keyCode)
+                                                    appendLog(
+                                                        "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
+                                                            "（uuid=$uuid usage=0x%02x → keyCode=$keyCode）"
+                                                                .format(consumerUsage),
+                                                    )
+                                                } else {
+                                                    appendLog(
+                                                        "EVENT: 车机媒体键 ${ConsumerKeys.nameOf(consumerUsage)}" +
+                                                            "（uuid=$uuid usage=0x%02x）无对应 Android 键，忽略"
+                                                                .format(consumerUsage),
+                                                    )
+                                                }
                                             }
                                         } else if (keyMap != null && report != null) {
                                             // Consumer 设备的「无按键」/释放报文（值为 0 或下标越界）：
@@ -2154,7 +2247,11 @@ object SessionController {
                                             targetFps = fps,
                                             log = { line -> appendLog(line) },
                                             keepAliveWithStats = setup.keepAliveSendStatsAsBody,
-                                            onEnded = {
+                                            onEnded = ended@{
+                                                // stop 不等待旧推流线程退出；迟到收尾不能复原新会话的状态。
+                                                if (currentClient !== client) return@ended
+                                                // 车机主动结束同样要释放长按，避免残留重复事件。
+                                                CarKeys.reset()
                                                 // 会话真实结束：解除静默降噪（客户端恢复探测/重连）
                                                 appendLog(">>> CarPlay 会话结束（推流终止）——恢复蓝牙探测")
                                                 BtSessionGate.sessionActive = false
@@ -2208,7 +2305,8 @@ object SessionController {
                                         )
                                         // 暗幕/常亮只在真正开始投屏后生效（见 ScreenDimmer.sessionActive）：
                                         // 应用启动时只挂触摸探针，避免「会话早断了、手机过一会儿还是变暗」。
-                                        if (ok) {
+                                        if (ok && currentClient === client && !client.cancelled && !connectCancelled) {
+                                            CarKeys.startSession()
                                             ScreenDimmer.setSessionActive(true)
                                             deliverPendingCarPlayUi()
                                         }

@@ -3,7 +3,10 @@ package io.github.shaonialife.cardeck.airplay
 import io.github.shaonialife.cardeck.iap2.Iap2Csm
 import io.github.shaonialife.cardeck.iap2.Iap2LinkEngine
 import io.github.shaonialife.cardeck.iap2.MfiLengthMemory
+import io.github.shaonialife.cardeck.iap2.asString
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -40,6 +43,114 @@ private fun splitLinkFrames(chunk: ByteArray): List<ByteArray> {
 }
 
 class VirtualIap2LinkTest {
+    /** 真实链路订阅后应发送缓存媒体和增量；StopNowPlaying 必须停止后续更新。 */
+    @Test
+    fun subscribedMediaUpdatesTravelThroughTheVirtualIap2Link() {
+        val h = Harness()
+        var song =
+            io.github.shaonialife.cardeck.iap2.Iap2NowPlayingSession
+                .Snapshot(title = "第一首", playing = true)
+        h.link.nowPlayingProvider = { song }
+        h.link.armMib3()
+        h.car.start(0)
+        h.exchangeUntilNormal()
+        val requested = Iap2Csm.group(0, Iap2Csm.param(1, ByteArray(0))) + Iap2Csm.group(1, Iap2Csm.param(0, ByteArray(0)))
+        h.carSends(0x5000, requested)
+
+        fun fields(): List<Iap2Csm.Param> = Iap2Csm.parseParams(h.lastRawFrameOf(0x5001)!!.copyOfRange(6, h.lastRawFrameOf(0x5001)!!.size))
+        assertEquals("第一首", Iap2Csm.parseParams(fields().first { it.id == 0 }.value).first().asString())
+        val firstCount = h.controlFrames().count { it.second == 0x5001 }
+
+        song = song.copy(title = "第二首", playing = false)
+        h.clock += 1_500
+        h.link.onCarBytes(ByteArray(0))
+        assertEquals(firstCount + 1, h.controlFrames().count { it.second == 0x5001 })
+        assertEquals("第二首", Iap2Csm.parseParams(fields().first { it.id == 0 }.value).first().asString())
+        assertArrayEquals(byteArrayOf(2), Iap2Csm.parseParams(fields().first { it.id == 1 }.value).first().value)
+
+        h.carSends(0x5002)
+        val stoppedCount = h.controlFrames().count { it.second == 0x5001 }
+        song = song.copy(title = "停止后不再发送")
+        h.clock += 1_500
+        h.link.onCarBytes(ByteArray(0))
+        assertEquals(stoppedCount, h.controlFrames().count { it.second == 0x5001 })
+    }
+
+    private val mediaDescriptor =
+        (
+            "05 0c 09 01 a1 01 15 00 25 01 05 0c 09 b0 09 b5 09 b6 " +
+                "0a 23 02 75 01 95 04 81 02 75 01 95 04 81 01 c0"
+        ).split(' ').map { it.toInt(16).toByte() }.toByteArray()
+
+    private val wheelDescriptor =
+        (
+            "05 01 09 08 a1 01 15 81 25 7f 75 08 95 01 09 38 81 06 c0"
+        ).split(' ').map { it.toInt(16).toByte() }.toByteArray()
+
+    /** 多组件必须使用各自的描述符，不能被最后一次 StartHID 覆盖。 */
+    @Test
+    fun differentHidComponentsKeepIndependentDescriptors() {
+        val h = Harness()
+        val wheels = mutableListOf<Int>()
+        val media = mutableListOf<Int>()
+        h.link.onControllerInput = { if (it.wheel != 0) wheels.add(it.wheel) }
+        h.link.onMediaKey = { media.add(it) }
+        h.link.armMib3()
+        h.car.start(0)
+        h.exchangeUntilNormal()
+        h.carSends(0x6800, Iap2Csm.u16(0, 10) + Iap2Csm.param(4, wheelDescriptor))
+        h.carSends(0x6800, Iap2Csm.u16(0, 11) + Iap2Csm.param(4, mediaDescriptor))
+        h.carSends(0x6802, Iap2Csm.u16(0, 10) + Iap2Csm.param(1, byteArrayOf(1)))
+        h.carSends(0x6802, Iap2Csm.u16(0, 11) + Iap2Csm.param(1, byteArrayOf(2)))
+        assertEquals(listOf(1), wheels)
+        assertEquals(listOf(android.view.KeyEvent.KEYCODE_MEDIA_NEXT), media)
+    }
+
+    /** 长组件名也会超过 8 字节，不能误当作 HID 描述符。 */
+    @Test
+    fun descriptorUsesItsParameterIdInsteadOfFirstLongField() {
+        val h = Harness()
+        val media = mutableListOf<Int>()
+        h.link.onMediaKey = { media.add(it) }
+        h.link.armMib3()
+        h.car.start(0)
+        h.exchangeUntilNormal()
+        h.carSends(0x6800, Iap2Csm.u16(0, 11) + Iap2Csm.string(5, "Panel media controls") + Iap2Csm.param(4, mediaDescriptor))
+        h.carSends(0x6802, Iap2Csm.u16(0, 11) + Iap2Csm.param(1, byteArrayOf(2)))
+        assertEquals(listOf(android.view.KeyEvent.KEYCODE_MEDIA_NEXT), media)
+    }
+
+    /** 未注册组件不能借用另一组件的描述符，也不能制造松开。 */
+    @Test
+    fun unknownHidComponentCannotBorrowAnotherDevicesDescriptor() {
+        val h = Harness()
+        val media = mutableListOf<Int>()
+        h.link.onMediaKey = { media.add(it) }
+        h.link.armMib3()
+        h.car.start(0)
+        h.exchangeUntilNormal()
+        h.carSends(0x6800, Iap2Csm.u16(0, 11) + Iap2Csm.param(4, mediaDescriptor))
+        h.carSends(0x6802, Iap2Csm.u16(0, 99) + Iap2Csm.param(1, byteArrayOf(2)))
+        assertEquals(emptyList<Int>(), media)
+    }
+
+    /** StopHID 终止组件时必须释放其导航键，并忽略 StartHID 前的迟到报告。 */
+    @Test
+    fun stopHidReleasesOnlyTheStoppedComponentAndRejectsLateReports() {
+        val h = Harness()
+        val reports = mutableListOf<io.github.shaonialife.cardeck.input.ControllerReports.Report>()
+        h.link.onControllerInput = { reports.add(it) }
+        h.link.armMib3()
+        h.car.start(0)
+        h.exchangeUntilNormal()
+        h.carSends(0x6800, Iap2Csm.u16(0, 11) + Iap2Csm.param(4, mediaDescriptor))
+        h.carSends(0x6802, Iap2Csm.u16(0, 11) + Iap2Csm.param(1, byteArrayOf(8)))
+        h.carSends(0x6803, Iap2Csm.u16(0, 11))
+        assertEquals(listOf(setOf(android.view.KeyEvent.KEYCODE_HOME), emptySet<Int>()), reports.map { it.keys })
+        h.carSends(0x6802, Iap2Csm.u16(0, 11) + Iap2Csm.param(1, byteArrayOf(8)))
+        assertEquals(2, reports.size)
+    }
+
     private class Harness {
         val controlSent = ArrayList<ByteArray>()
         val allControl = ArrayList<ByteArray>()
@@ -316,5 +427,128 @@ class VirtualIap2LinkTest {
         val body = byteArrayOf(0x00, 0x05, 0x00, 0x00, 0x08)
         val report = VirtualIap2Link.hidReportFromParams(Iap2Csm.parseParams(body))
         assertEquals(listOf<Byte>(0x08), report?.toList())
+    }
+
+    /** 显式空 data 或多参数缺 data 都是残缺消息，不能把元数据当作按键。 */
+    @Test
+    fun incompleteHidCommandDoesNotFallBackToMetadata() {
+        val emptyData = Iap2Csm.param(0, byteArrayOf(0, 3)) + Iap2Csm.param(1, ByteArray(0))
+        val missingData = Iap2Csm.param(0, byteArrayOf(0, 3)) + Iap2Csm.param(2, byteArrayOf(8))
+        assertNull(VirtualIap2Link.hidReportFromParams(Iap2Csm.parseParams(emptyData)))
+        assertNull(VirtualIap2Link.hidReportFromParams(Iap2Csm.parseParams(missingData)))
+    }
+
+    /** 同一份马自达旋钮描述符经 iAP2 承载时仍应送入控制器通路。 */
+    @Test
+    fun mazdaKnobThroughIap2KeepsButtonsAndRelativeWheel() {
+        val h = Harness()
+        val reports = mutableListOf<io.github.shaonialife.cardeck.input.ControllerReports.Report>()
+        h.link.onControllerInput = { reports.add(it) }
+        h.link.armMib3()
+        h.car.start(0)
+        h.exchangeUntilNormal()
+        val descriptor =
+            (
+                "05 01 09 08 a1 01 05 09 09 01 15 00 25 01 75 01 95 01 81 02 " +
+                    "05 0c 0a 24 02 95 01 81 02 95 06 81 01 05 01 09 01 a1 00 " +
+                    "09 30 09 31 15 81 25 7f 75 08 95 02 81 02 c0 09 38 15 81 " +
+                    "25 7f 75 08 95 01 81 06 c0"
+            ).split(' ').map { it.toInt(16).toByte() }.toByteArray()
+        h.carSends(0x6800, Iap2Csm.param(2, descriptor))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(1, 0, 0, 1)))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(1, 0, 0, 1)))
+        assertEquals(2, reports.size)
+        assertEquals(setOf(android.view.KeyEvent.KEYCODE_DPAD_CENTER), reports[0].keys)
+        assertEquals(listOf(1, 1), reports.map { it.wheel })
+    }
+
+    /** 主页属于导航，不能被 iAP2 媒体键通路当成未知音频键吞掉。 */
+    @Test
+    fun mediaBitmapHomeThroughIap2IsNotDispatchedAsAudio() {
+        val h = Harness()
+        val reports = mutableListOf<io.github.shaonialife.cardeck.input.ControllerReports.Report>()
+        val media = mutableListOf<Int>()
+        h.link.onControllerInput = { reports.add(it) }
+        h.link.onMediaKey = { media.add(it) }
+        h.link.armMib3()
+        h.car.start(0)
+        h.exchangeUntilNormal()
+        val descriptor =
+            (
+                "05 0c 09 01 a1 01 15 00 25 01 05 0c 09 b0 09 b5 09 b6 " +
+                    "0a 23 02 75 01 95 04 81 02 75 01 95 04 81 01 c0"
+            ).split(' ')
+                .map { it.toInt(16).toByte() }
+                .toByteArray()
+        h.carSends(0x6800, Iap2Csm.param(2, descriptor))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(8)))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(0)))
+        assertEquals(setOf(android.view.KeyEvent.KEYCODE_HOME), reports[0].keys)
+        assertEquals(emptySet<Int>(), reports[1].keys)
+        assertEquals(emptyList<Int>(), media)
+    }
+
+    /** 旋钮和媒体 Collection 同属一个设备时，两种报告都要消费。 */
+    @Test
+    fun compositeHidDeliversBothWheelAndMediaReports() {
+        val h = Harness()
+        val wheels = mutableListOf<Int>()
+        val media = mutableListOf<Int>()
+        h.link.onControllerInput = { if (it.wheel != 0) wheels.add(it.wheel) }
+        h.link.onMediaKey = { media.add(it) }
+        h.link.armMib3()
+        h.car.start(0)
+        h.exchangeUntilNormal()
+        val descriptor =
+            (
+                "05 01 09 08 a1 01 85 01 15 81 25 7f 75 08 95 01 09 38 81 06 c0 " +
+                    "05 0c 09 01 a1 01 85 02 15 00 25 01 75 01 95 01 09 b5 81 02 75 07 81 01 c0"
+            ).split(' ').map { it.toInt(16).toByte() }.toByteArray()
+        h.carSends(0x6800, Iap2Csm.param(2, descriptor))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(1, 1)))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(2, 1)))
+        assertEquals(listOf(1), wheels)
+        assertEquals(listOf(android.view.KeyEvent.KEYCODE_MEDIA_NEXT), media)
+    }
+
+    /** 无描述符的多字节包不能只按首字节猜媒体键，旋钮和电话也有同样长度。 */
+    @Test
+    fun unknownMultiByteHidReportCannotTriggerAudio() {
+        val h = Harness()
+        val media = mutableListOf<Int>()
+        h.link.onMediaKey = { media.add(it) }
+        h.link.armMib3()
+        h.car.start(0)
+        h.exchangeUntilNormal()
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(0xB5.toByte(), 1, 0, 0)))
+        assertEquals(emptyList<Int>(), media)
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(0xB5.toByte())))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(0xB5.toByte(), 1, 0, 0)))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(0xB5.toByte())))
+        assertEquals(listOf(android.view.KeyEvent.KEYCODE_MEDIA_NEXT), media)
+    }
+
+    /** 第二组报告的空位不应令第一组持续按下被重新当成一次短按。 */
+    @Test
+    fun mediaReportIdsKeepTheirHeldStateAcrossInterleavedReports() {
+        val h = Harness()
+        val media = mutableListOf<Int>()
+        h.link.onMediaKey = { media.add(it) }
+        h.link.armMib3()
+        h.car.start(0)
+        h.exchangeUntilNormal()
+        val descriptor =
+            (
+                "05 0c 09 01 a1 01 85 01 15 00 25 01 75 01 95 01 09 b5 81 02 75 07 81 01 " +
+                    "85 02 75 01 09 b6 81 02 75 07 81 01 c0"
+            ).split(' ').map { it.toInt(16).toByte() }.toByteArray()
+        h.carSends(0x6800, Iap2Csm.param(2, descriptor))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(1, 1)))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(2, 0)))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(1, 1)))
+        assertEquals(listOf(android.view.KeyEvent.KEYCODE_MEDIA_NEXT), media)
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(1, 0)))
+        h.carSends(0x6802, Iap2Csm.param(1, byteArrayOf(1, 1)))
+        assertEquals(List(2) { android.view.KeyEvent.KEYCODE_MEDIA_NEXT }, media)
     }
 }

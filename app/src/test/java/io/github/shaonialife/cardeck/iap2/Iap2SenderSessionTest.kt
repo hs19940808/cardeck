@@ -16,6 +16,42 @@ import java.util.concurrent.atomic.AtomicReference
  * 验证 Phase 1 全序列（识别→MFi 跳过→HID→WiFi 配置→CarPlay 启动→通知）。
  */
 class Iap2SenderSessionTest {
+    /** Phase 1 之后的真实链路帧必须绕过日志限流，重复 Wheel +1 不能丢。 */
+    @Test(timeout = 15_000)
+    fun bluetoothPumpDispatchesContinuousWheelAndComponentStop() {
+        val pair = InMemoryStreamPair()
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val accessory = MockAccessory(accessoryChannel, lateHidReports = true)
+        val accessoryThread =
+            Thread({ accessory.run() }, "mock-hid-accessory").apply {
+                isDaemon = true
+                start()
+            }
+        val reports = java.util.concurrent.CopyOnWriteArrayList<io.github.shaonialife.cardeck.input.ControllerReports.Report>()
+        val received = CountDownLatch(5)
+        val session = Iap2SenderSession(phoneChannel, log = {})
+        session.onControllerInput = {
+            reports.add(it)
+            received.countDown()
+        }
+        val pump = Thread({ session.pumpIncomingForever() }, "phone-hid-pump").apply { isDaemon = true }
+        try {
+            session.run(timeoutMillis = 10_000L)
+            pump.start()
+            assertTrue("蓝牙保活泵丢失 HID 输入", received.await(5, TimeUnit.SECONDS))
+            assertEquals(listOf(1, 1, 1), reports.map { it.wheel }.filter { it != 0 })
+            val home = reports.filter { it.id < 0 }
+            assertEquals(listOf(setOf(android.view.KeyEvent.KEYCODE_HOME), emptySet<Int>()), home.map { it.keys })
+            assertEquals(listOf(19, 20), accessory.hidResponseComponents.toList())
+        } finally {
+            phoneChannel.close()
+            accessoryChannel.close()
+            pump.join(2_000)
+            accessoryThread.join(2_000)
+        }
+    }
+
     @Test
     fun fullBringUpAgainstMockAccessory() {
         val pair = InMemoryStreamPair()
@@ -151,9 +187,12 @@ class Iap2SenderSessionTest {
          * IPv4 后跟 5 个）。用于锁定「必须去掉全部尾部 NUL」这一行为。
          */
         private val padAddresses: Boolean = false,
+        /** 保活阶段再出现两种 HID 组件，模拟通过蓝牙继续上报物理控制器。 */
+        private val lateHidReports: Boolean = false,
     ) {
         private val parser = Iap2Csm.Parser()
         private val pending = ArrayDeque<Iap2Csm.Frame>()
+        val hidResponseComponents = java.util.concurrent.CopyOnWriteArrayList<Int>()
 
         fun run() {
             check(channel.awaitReady(10_000)) { "mock link not ready" }
@@ -181,6 +220,9 @@ class Iap2SenderSessionTest {
             // 订阅 + StartHID（奥迪形态不发，发送端应直接跳过等待）
             if (!audiDeclarations) {
                 send(Iap2MessageIds.START_NOW_PLAYING_UPDATES)
+                // 订阅应立即获得媒体状态，不能把合法的 0x5001 误判为乱序 HID 应答。
+                val nowPlaying = expect(Iap2MessageIds.NOW_PLAYING_UPDATE)
+                check(Iap2Csm.parseParams(nowPlaying.body).map { it.id } == listOf(0, 1))
                 send(Iap2MessageIds.START_POWER_UPDATES)
                 send(
                     Iap2MessageIds.START_HID,
@@ -225,6 +267,35 @@ class Iap2SenderSessionTest {
                 Thread.sleep(150)
                 sendStartSession()
             }
+            if (lateHidReports) {
+                // Wi-Fi 配置旁迟到的订阅由保活泵消费，先确认它的应答，再检查 HID 应答。
+                expect(Iap2MessageIds.NOW_PLAYING_UPDATE)
+                sendLateHidReports()
+            }
+        }
+
+        /** 两个组件交替发送，StartHID 应答必须回显各自编号。 */
+        private fun sendLateHidReports() {
+            val wheel =
+                "05 01 09 08 a1 01 15 81 25 7f 75 08 95 01 09 38 81 06 c0"
+                    .split(' ')
+                    .map { it.toInt(16).toByte() }
+                    .toByteArray()
+            val home =
+                "05 0c 09 01 a1 01 15 00 25 01 75 01 95 01 0a 23 02 81 02 75 07 81 01 c0"
+                    .split(' ')
+                    .map { it.toInt(16).toByte() }
+                    .toByteArray()
+            send(Iap2MessageIds.START_HID, Iap2Csm.u16(0, 19), Iap2Csm.param(4, wheel))
+            val wheelAck = Iap2Csm.parseParams(expect(Iap2MessageIds.DEVICE_HID_REPORT).body).first { it.id == 0 }.value
+            hidResponseComponents.add(((wheelAck[0].toInt() and 255) shl 8) or (wheelAck[1].toInt() and 255))
+            repeat(2) { send(Iap2MessageIds.ACCESSORY_HID_REPORT, Iap2Csm.u16(0, 19), Iap2Csm.param(1, byteArrayOf(1))) }
+            send(Iap2MessageIds.START_HID, Iap2Csm.u16(0, 20), Iap2Csm.param(4, home))
+            val homeAck = Iap2Csm.parseParams(expect(Iap2MessageIds.DEVICE_HID_REPORT).body).first { it.id == 0 }.value
+            hidResponseComponents.add(((homeAck[0].toInt() and 255) shl 8) or (homeAck[1].toInt() and 255))
+            send(Iap2MessageIds.ACCESSORY_HID_REPORT, Iap2Csm.u16(0, 20), Iap2Csm.param(1, byteArrayOf(1)))
+            send(Iap2MessageIds.STOP_HID, Iap2Csm.u16(0, 20))
+            send(Iap2MessageIds.ACCESSORY_HID_REPORT, Iap2Csm.u16(0, 19), Iap2Csm.param(1, byteArrayOf(1)))
         }
 
         private fun sendStartSession() {
@@ -280,7 +351,7 @@ class Iap2SenderSessionTest {
             }
         }
 
-        private fun expect(messageId: Int) {
+        private fun expect(messageId: Int): Iap2Csm.Frame {
             println("MOCK expect 0x${messageId.toString(16)}")
             val frame =
                 recvFrame(10_000)
@@ -289,6 +360,7 @@ class Iap2SenderSessionTest {
                 "mock expected 0x${messageId.toString(16)} got 0x${frame.messageId.toString(16)}"
             }
             println("MOCK got 0x${frame.messageId.toString(16)}")
+            return frame
         }
 
         private fun recvFrame(timeoutMillis: Long): Iap2Csm.Frame? {

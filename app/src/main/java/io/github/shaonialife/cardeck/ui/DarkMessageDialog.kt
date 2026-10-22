@@ -187,5 +187,7 @@ object DarkMessageDialog {
                 isEnabled = false
                 onClick()
             }
+            isFocusable = true
+            foreground = activity.getDrawable(R.drawable.bg_hardware_focus)
         }
 }

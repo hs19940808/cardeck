@@ -14,6 +14,23 @@ class CarPlayModesTest {
         assertResource(snapshot, 2L, 1L, 1L)
     }
 
+    /** 对照实车 /info 的 Take、导航键的 Untake 和 maps: 请求，必须产生真实归属变化。 */
+    @Test
+    fun mazdaInitialClaimAndNavigationReleaseDoNotStartWithFalsePhoneOwnership() {
+        val modes = CarPlayModes()
+        val initial = modes.change(request(1L, 1L))
+        assertEquals(0L, initial["status"])
+        assertResource(modes.snapshot(), 1L, 2L, 2L)
+
+        val released = modes.change(mapOf("resources" to listOf(mapOf("resourceID" to 1L, "transferType" to 2L))))
+        assertEquals(0L, released["status"])
+        assertResource(modes.snapshot(), 1L, 0L, 0L)
+
+        modes.takeScreen()
+        assertResource(modes.snapshot(), 1L, 1L, 1L)
+        assertResource(modes.snapshot(), 2L, 1L, 1L)
+    }
+
     @Test
     fun carTakingScreenGetsAnAcceptedSnapshotInsteadOfPhoneReclaimingIt() {
         val modes = CarPlayModes()

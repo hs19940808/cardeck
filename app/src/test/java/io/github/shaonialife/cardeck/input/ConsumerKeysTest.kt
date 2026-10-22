@@ -161,4 +161,60 @@ class ConsumerKeysTest {
         assertEquals(listOf(0xB6), map.usagesFor(byteArrayOf(0x06)))
         assertEquals(emptyList<Int>(), map.usagesFor(byteArrayOf(0x00)))
     }
+
+    /** smartBox 的四个位依次为播放、下一曲、上一曲、主页。 */
+    @Test
+    fun mazdaMediaBitmapKeepsHomeSeparateFromAudioKeys() {
+        val descriptor =
+            hex(
+                "05 0c 09 01 a1 01 15 00 25 01 05 0c 09 b0 09 b5 09 b6 0a 23 02 75 01 95 04 81 02 75 01 95 04 81 01 c0",
+            )
+        val map = requireNotNull(ConsumerKeys.parseDescriptor(descriptor))
+        assertEquals(listOf(0xB0, 0xB5), map.usagesFor(byteArrayOf(3)))
+        assertEquals(listOf(0x223), map.usagesFor(byteArrayOf(8)))
+        assertEquals(KeyEvent.KEYCODE_HOME, ControllerReports.navigationKeyCode(0x223))
+        assertEquals(0, ConsumerKeys.keyCodeFor(0x223))
+    }
+
+    /** Report ID 和填充字节均不能当作按键位。 */
+    @Test
+    fun bitmapWithReportIdAndLeadingPaddingUsesDeclaredOffsets() {
+        val map =
+            requireNotNull(
+                ConsumerKeys.parseDescriptor(
+                    hex(
+                        "05 0c 09 01 a1 01 85 03 15 00 25 01 75 01 95 03 81 01 " +
+                            "09 b0 09 b5 09 b6 95 03 81 02 95 02 81 01 c0",
+                    ),
+                ),
+            )
+        assertEquals(listOf(0xB5), map.usagesFor(byteArrayOf(3, 0x10)))
+        assertFalse(map.accepts(byteArrayOf(3)))
+        assertFalse(map.accepts(byteArrayOf(2, 0x10)))
+    }
+
+    /** 两个报告分别持续上报，ID 2 的松开不能重置 ID 1 的按住状态。 */
+    @Test
+    fun mediaStateIsIndependentForEachReportId() {
+        val map =
+            requireNotNull(
+                ConsumerKeys.parseDescriptor(
+                    hex(
+                        "05 0c 09 01 a1 01 85 01 15 00 25 01 75 01 95 01 09 b5 81 02 75 07 81 01 " +
+                            "85 02 75 01 09 b6 81 02 75 07 81 01 c0",
+                    ),
+                ),
+            )
+        val state = HidKeyState()
+
+        fun update(vararg bytes: Byte): List<Pair<Int, Boolean>> {
+            val report = bytes
+            return state.update("media:${map.reportId(report)}", map.usagesFor(report).toSet())
+        }
+        assertEquals(listOf(0xB5 to true), update(1, 1))
+        assertEquals(listOf(0xB6 to true), update(2, 1))
+        assertEquals(listOf(0xB6 to false), update(2, 0))
+        assertEquals(emptyList<Pair<Int, Boolean>>(), update(1, 1))
+        assertEquals(listOf(0xB5 to false), update(1, 0))
+    }
 }

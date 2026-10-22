@@ -7,7 +7,9 @@ import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
+import io.github.shaonialife.cardeck.iap2.Iap2NowPlayingSession
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
+import io.github.shaonialife.cardeck.input.ControllerReports
 import io.github.shaonialife.cardeck.transport.Iap2LinkChannel
 import io.github.shaonialife.cardeck.transport.StreamDuplexStream
 import java.io.IOException
@@ -34,6 +36,11 @@ class Iap2BluetoothServer(
     /** 目标车机（动态读取：拒绝非目标设备的连入；null=来者不拒）。 */
     private val targetProvider: () -> TargetDevicePrefs.Target? = { null },
 ) {
+    /** 车机回连与主动连接共用 HID 处理，每次连接保留独立的来源编号。 */
+    internal var onControllerInput: ((String, ControllerReports.Report) -> Unit)? = null
+    internal var onMediaKey: ((Int) -> Unit)? = null
+    internal var nowPlayingProvider: (() -> Iap2NowPlayingSession.Snapshot?)? = null
+
     companion object {
         /**
          * iPhone 的 iAP2 服务 UUID（Oligo Security 公布；与 xcertplay
@@ -141,7 +148,17 @@ class Iap2BluetoothServer(
         activeChannel = channel
         BtSessionGate.inboundActive = true
         try {
-            channel.runSenderSession(context, SESSION_TIMEOUT_MILLIS, log, onEndpoint, onWifiCredentials, onEndpointUpdate)
+            channel.runSenderSession(
+                context,
+                SESSION_TIMEOUT_MILLIS,
+                log,
+                onEndpoint,
+                onWifiCredentials,
+                onEndpointUpdate,
+                { source, report -> onControllerInput?.invoke(source, report) },
+                { key -> onMediaKey?.invoke(key) },
+                { nowPlayingProvider?.invoke() },
+            )
         } catch (error: IOException) {
             log("SESSION 失败: ${error.message}")
         } finally {

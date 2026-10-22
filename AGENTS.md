@@ -746,8 +746,35 @@ DockActivity，不受信）+ CarPlayApp（原生应用屏）+ CarPlayAppHi（超
   DiPlay 两套真实描述符），改这些解析器先看测试。
 - **风格**：Kotlin，中文注释（注释写「为什么/实测依据」而非复述代码）；UI 文案中文。
   `reference/` 下是 GPL 参考仓库（gitignore，勿复制代码入本项目、勿外传）。
+- **昂克赛拉无触摸屏的按键链路**（2026-10-21）：用户车机只靠按键/旋钮，不能用触摸
+  可用来代替输入验收。smartBox 声明的 `Knob & Buttons` 描述符解得 4B：第 0 字节
+  bit0=确认、bit1=AC Back，随后为有符号 X/Y 与相对 Wheel。布局由 `HidInputLayout`
+  解析，不按 uuid/包长硬编码；保留 Report ID、Constant 填充与 Array/Variable 差异。
+  旋转是增量：连续两包 +1 必须移动两格；按键是持续状态：重复 DOWN 不能反复点击。
+  标准 `hidSendReport` 的字段可在 `params` 内，旧平铺也要兼容。媒体位图含主页
+  Usage 0x223，必须走导航通路，不能全交给 AudioManager。Shizuku `keyEvent` 追加在
+  AIDL 末尾，显式绑定虚拟屏，松开回原目标屏；会话退役时取消重复并发 canceled UP。
+  自有页面的焦点/描边由 `CarFocusNavigation` 管，桌面分页的第 0 页就是仪表盘，
+  Dock 与应用屏需显式接续焦点。翻页回调只调 `syncDashboard`，禁止在 UI 线程调
+  `showDesktop/showDashboard`（两者会执行 Shell）。第三方应用的键盘导航支持、实际
+  旋转方向及长按效果须实车验收，软件测试不能宣称已验证这些行为。
+  多来源同键须合并为一对 DOWN/UP；组合描述符按 Application 分流，不能识别出旋钮
+  就把同描述符内的媒体 Collection 提前吞掉。`CarKeys.startSession` 与隐形屏 attach
+  成功绑定，退役/推流结束都 reset 并关入口，避免迟到 HID 继续操作遗留屏。
+  设置滑条的持久化不得仅放在 `onStopTrackingTouch`，方向键不会触发该回调。
+  蓝牙保活泵与 Wi-Fi 隧道的 iAP2 HID 共用 `Iap2HidSession`：参数 0 是组件号，
+  描述符优先参数 4（旧接收端参数 2），不能只存最后一个组件或按字段长度猜描述符。
+  保活泵必须在日志限流前消费 HID；StopHID/重注册/断链要释放对应来源，
+  `CarKeys` 按来源快照统一合并后再生成 DOWN/UP，不能直接合并各通道的边沿。
 
 ## 知识沉淀约定
+
+- **切屏通知必须走事件通道**（2026-10-22 昂克赛拉实车日志排查）：`requestUI maps:`
+  已到达、虚拟屏启动地图且视频持续发送，并不证明原车已显示 CarPlay。普通
+  `modesChanged` 应使用 `postEventCommand`（Events 密钥/独立 CSeq），不能把控制连接
+  对 `/command` 的 `200 OK` 当成资源处理成功。初始化也要消费 `/info.modes` 中的
+  原车资源请求；日志区分“事件写入”“对应 CSeq 应答”和“手机虚拟屏页面切换”。
+  本地回环覆盖明文/加密通道，实车显示结果仍须另验。
 
 - **随时补录**：工作中遇到值得记录的点——性能实测结论、踩坑、设计决策、已知问题与
   放弃方向——应随手补录到本文件对应章节，后续根据实际情况再调整组织结构。

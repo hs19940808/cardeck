@@ -31,4 +31,7 @@ interface ICarInput {
     // 服务进程 PID：应用侧清理「非当前绑定进程」的陈旧 UserService 时用于排除自己
     // （旧进程持有的虚拟屏跨进程无法 release，杀进程是唯一释放途径，见 CarInputClient）。
     int pid();
+
+    // 追加接口以保留已有事务编号。按键绑定虚拟屏，DOWN/UP 共用 downTime。
+    boolean keyEvent(int displayId, int action, int keyCode, int metaState, long downTime, int repeatCount, boolean canceled);
 }

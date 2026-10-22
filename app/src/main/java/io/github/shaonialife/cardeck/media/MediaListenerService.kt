@@ -151,7 +151,8 @@ class MediaListenerService : NotificationListenerService() {
                     positionMs = state?.position ?: 0L,
                     playbackSpeed = if (playing) (state?.playbackSpeed ?: 1f) else 0f,
                     durationMs = meta?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L,
-                    anchoredAtMs = android.os.SystemClock.elapsedRealtime(),
+                    anchoredAtMs = state?.lastPositionUpdateTime?.takeIf { it > 0 } ?: android.os.SystemClock.elapsedRealtime(),
+                    album = meta?.getString(MediaMetadata.METADATA_KEY_ALBUM),
                 )
             }
         MediaSessionsState.publish(now)
@@ -236,13 +237,14 @@ object MediaSessionsState {
         val durationMs: Long = 0L,
         /** 位置采样的 SystemClock.elapsedRealtime 锚点。 */
         val anchoredAtMs: Long = 0L,
+        val album: String? = null,
     ) {
         /** 渲染时刻的推算播放位置（播放中按速度外推，钳制在时长内）。 */
         fun displayPositionAt(elapsedRealtimeMs: Long): Long {
             if (durationMs <= 0) return 0
             val base =
                 if (playing && anchoredAtMs > 0) {
-                    positionMs + ((elapsedRealtimeMs - anchoredAtMs) * playbackSpeed).toLong()
+                    positionMs + ((elapsedRealtimeMs - anchoredAtMs).coerceAtLeast(0) * playbackSpeed).toLong()
                 } else {
                     positionMs
                 }
@@ -282,6 +284,7 @@ object MediaSessionsState {
         val contentChanged =
             old?.title != value?.title ||
                 old?.artist != value?.artist ||
+                old?.album != value?.album ||
                 old?.playing != value?.playing ||
                 old?.art !== value?.art
         if (contentChanged) {

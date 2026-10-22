@@ -1,9 +1,12 @@
 package io.github.shaonialife.cardeck.bt
 
 import android.content.Context
+import io.github.shaonialife.cardeck.iap2.Iap2NowPlayingSession
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
+import io.github.shaonialife.cardeck.input.ControllerReports
 import io.github.shaonialife.cardeck.transport.Iap2LinkChannel
 import io.github.shaonialife.cardeck.util.DeviceIdentity
+import java.util.UUID
 
 /**
  * BT 控制会话核心流程（Server/Client 共用，此前两份近乎复制）：
@@ -17,7 +20,11 @@ internal fun Iap2LinkChannel.runSenderSession(
     onEndpoint: (Iap2SenderSession.CarPlayEndpoint) -> Unit,
     onWifiCredentials: (Iap2SenderSession.WifiConfiguration) -> Unit,
     onEndpointUpdate: (Iap2SenderSession.CarPlayEndpoint) -> Unit,
+    onControllerInput: (String, ControllerReports.Report) -> Unit,
+    onMediaKey: (Int) -> Unit,
+    nowPlayingProvider: () -> Iap2NowPlayingSession.Snapshot?,
 ) {
+    val source = "bt:${UUID.randomUUID()}"
     val session =
         Iap2SenderSession(
             this,
@@ -29,10 +36,17 @@ internal fun Iap2LinkChannel.runSenderSession(
             // MFi 挑战长度按车机身份持久化（省掉 20B 静默 6 秒的试探）
             context.applicationContext,
         )
-    val endpoint = session.run(timeoutMillis)
-    onEndpoint(endpoint)
-    // Phase 2 过渡：保持控制通道存活记录配件消息；AirPlay 配对由 onEndpoint 回调发起
-    session.pumpIncomingForever()
+    session.onControllerInput = { onControllerInput(source, it) }
+    session.onMediaKey = onMediaKey
+    session.nowPlayingProvider = nowPlayingProvider
+    try {
+        val endpoint = session.run(timeoutMillis)
+        onEndpoint(endpoint)
+        // 保活泵同时消费 HID；每次 RFCOMM 连接有独立来源，旧连接松开不影响新连接。
+        session.pumpIncomingForever()
+    } finally {
+        session.releaseControlState()
+    }
 }
 
 /**

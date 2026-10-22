@@ -10,6 +10,7 @@ import android.hardware.display.VirtualDisplay
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import io.github.shaonialife.cardeck.input.CarKeys
 import io.github.shaonialife.cardeck.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.cardeck.launcher.settings.DisplayPrefs
 import io.github.shaonialife.cardeck.media.NotificationAccess
@@ -804,6 +805,7 @@ object VirtualLauncher {
         val grid = if (gridDisplayId >= 0) gridDisplayId else appDisplayId
         val pkg = appContextRef?.packageName ?: return false
         val ok = startOn(grid, "$pkg/.launcher.GridActivity")
+        if (ok) CarKeys.focusDock(false)
         composer?.requestActiveApp(appHiDisplayId >= 0 && grid == appHiDisplayId)
         // 桌面上的提示没有意义（顶层不是第三方应用），直接收起
         LetterboxHintController.clear()
@@ -981,6 +983,7 @@ object VirtualLauncher {
             "LAUNCH(${component.packageName}): → 地图屏全屏 ok=$ok out=${result.output.take(80)}",
         )
         if (ok) {
+            CarKeys.focusDock(false)
             synchronized(runningApps) { runningApps.add(component) }
             notifyRunningAppsChanged()
             appContextRef?.let {
@@ -1129,6 +1132,7 @@ object VirtualLauncher {
                 "out=${result.output.take(80)}",
         )
         if (ok) {
+            CarKeys.focusDock(false)
             synchronized(runningApps) { runningApps.add(component) }
             notifyRunningAppsChanged()
             // 仪表盘/全屏地图中打开普通应用：退出仪表盘并隐藏地图层，

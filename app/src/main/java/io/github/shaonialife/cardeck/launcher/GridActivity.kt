@@ -15,6 +15,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import io.github.shaonialife.cardeck.R
+import io.github.shaonialife.cardeck.input.RotaryFocusHost
+import io.github.shaonialife.cardeck.input.nextRotaryCell
 import io.github.shaonialife.cardeck.media.MediaSessionsState
 import io.github.shaonialife.cardeck.render.CARD_MARGIN_PX
 import io.github.shaonialife.cardeck.ui.WallpaperStore
@@ -29,7 +31,9 @@ import io.github.shaonialife.cardeck.util.Bg
  * 默认只显示地图类应用（DesktopApps 默认选择），第一格固定「车机设置」入口；
  * 用户可在设置页勾选要显示的应用，返回桌面（onResume）即时刷新。
  */
-class GridActivity : AppCompatActivity() {
+class GridActivity :
+    AppCompatActivity(),
+    RotaryFocusHost {
     /** 桌面格子：仪表盘页（第 0 页）/ 固定设置入口 / 普通应用。 */
     private sealed interface Cell {
         object Dashboard : Cell
@@ -42,6 +46,62 @@ class GridActivity : AppCompatActivity() {
     }
 
     private var pages: List<List<Cell>> = emptyList()
+    private var rotaryPage = -1
+    private var rotaryCell = -1
+
+    /** 按页面逻辑顺序移动，快速连转时不依赖尚未完成的 ViewPager 布局。 */
+    override fun moveRotaryFocus(forward: Boolean): Boolean {
+        val page = pager?.currentItem ?: return false
+        val counts = pages.indices.map(::rotaryCellCount)
+        val current = rotaryCell.takeIf { rotaryPage == page && it >= 0 }
+        val next = nextRotaryCell(counts, page, current, forward) ?: return false
+        focusRotaryCell(next.first, next.second)
+        return true
+    }
+
+    /** 从 Dock 转回桌面时接续整套分页的首尾位置。 */
+    override fun focusRotaryEdge(forward: Boolean) {
+        val page = if (forward) 0 else (pager?.adapter?.itemCount ?: 1) - 1
+        focusRotaryCell(page, if (forward) 0 else rotaryCellCount(page) - 1)
+    }
+
+    /** 仪表盘有三个媒体控件，其余页面使用实际应用数，不依赖固定行数。 */
+    private fun rotaryCellCount(page: Int): Int = if (page == 0) 3 else pages.getOrNull(page)?.size ?: 0
+
+    /** 控件尚未绑定时保留位置，由 bindRotaryCell 在布局完成后补聚焦。 */
+    private fun focusRotaryCell(
+        page: Int,
+        cell: Int,
+    ) {
+        rotaryPage = page
+        rotaryCell = cell
+        pager?.setCurrentItem(page, false)
+        window.decorView.post {
+            if (rotaryPage == page && rotaryCell == cell) window.decorView.findViewWithTag<View>(page to cell)?.requestFocus()
+        }
+    }
+
+    /** 聚焦位置随方向键/鼠标操作同步，旋钮不会从旧位置突然跳回。 */
+    private fun bindRotaryCell(
+        view: View,
+        page: Int,
+        cell: Int,
+    ) {
+        view.tag = page to cell
+        view.isFocusable = true
+        view.setOnFocusChangeListener { _, focused ->
+            if (focused) {
+                rotaryPage = page
+                rotaryCell = cell
+            }
+        }
+        if (rotaryPage == page && rotaryCell == cell) {
+            view.post {
+                if (pager?.currentItem == page && rotaryPage == page && rotaryCell == cell) view.requestFocus()
+            }
+        }
+    }
+
     private var pager: ViewPager2? = null
     private var dotsRow: LinearLayout? = null
     private var cellWidthPx = 0
@@ -385,8 +445,7 @@ class GridActivity : AppCompatActivity() {
                 override fun onPageSelected(position: Int) {
                     updateDots(position)
                     // 用户滑动切换仪表盘/桌面：回写 launcher（含地图任务与 tile 布局）
-                    if (position == 0 && !VirtualLauncher.dashboardMode) VirtualLauncher.showDashboard()
-                    if (position != 0 && VirtualLauncher.dashboardMode) VirtualLauncher.showDesktop()
+                    VirtualLauncher.syncDashboard(position == 0)
                 }
 
                 override fun onPageScrolled(
@@ -633,6 +692,9 @@ class GridActivity : AppCompatActivity() {
                     400,
                 )
             }
+            listOf(R.id.dashPrev, R.id.dashPlayPause, R.id.dashNext).forEachIndexed { index, id ->
+                bindRotaryCell(panel.findViewById(id), 0, index)
+            }
             // 全屏地图的退出走 dock 的 home 按钮（showDashboard 路由闸门会自动
             // setMapFullscreen(false)），仪表盘卡上不再放「全屏地图」按钮
             applyDashCardChrome()
@@ -646,7 +708,7 @@ class GridActivity : AppCompatActivity() {
     ) : RecyclerView.ViewHolder(grid) {
         fun bind(page: Int) {
             grid.removeAllViews()
-            pages[page].forEach { cell ->
+            pages[page].forEachIndexed { index, cell ->
                 val view = layoutInflater.inflate(R.layout.item_app_cell, grid, false)
                 val icon =
                     view.findViewById<ImageView>(R.id.cellIcon).apply {
@@ -671,6 +733,7 @@ class GridActivity : AppCompatActivity() {
                         }
                     }
                 }
+                bindRotaryCell(view, page, index)
                 grid.addView(
                     view,
                     GridLayout.LayoutParams().apply {

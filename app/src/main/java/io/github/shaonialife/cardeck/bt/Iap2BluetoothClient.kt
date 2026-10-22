@@ -8,7 +8,9 @@ import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
+import io.github.shaonialife.cardeck.iap2.Iap2NowPlayingSession
 import io.github.shaonialife.cardeck.iap2.Iap2SenderSession
+import io.github.shaonialife.cardeck.input.ControllerReports
 import io.github.shaonialife.cardeck.transport.Iap2LinkChannel
 import io.github.shaonialife.cardeck.transport.StreamDuplexStream
 import java.io.IOException
@@ -37,6 +39,11 @@ class Iap2BluetoothClient(
     /** 目标车机（动态读取：选择后无需重启链路，下一轮尝试即生效）。 */
     private val targetProvider: () -> TargetDevicePrefs.Target? = { null },
 ) {
+    /** 仅向当前车机会话转发 HID，连接结束时同一来源会补发松开。 */
+    internal var onControllerInput: ((String, ControllerReports.Report) -> Unit)? = null
+    internal var onMediaKey: ((Int) -> Unit)? = null
+    internal var nowPlayingProvider: (() -> Iap2NowPlayingSession.Snapshot?)? = null
+
     companion object {
         /**
          * 配件端（车机）无线 iAP2 服务 UUID。
@@ -371,7 +378,17 @@ class Iap2BluetoothClient(
         val channel = Iap2LinkChannel(stream, name = "iap2-bt-car") { line -> log(line) }
         activeChannel = channel
         try {
-            channel.runSenderSession(context, SESSION_TIMEOUT_MILLIS, log, onEndpoint, onWifiCredentials, onEndpointUpdate)
+            channel.runSenderSession(
+                context,
+                SESSION_TIMEOUT_MILLIS,
+                log,
+                onEndpoint,
+                onWifiCredentials,
+                onEndpointUpdate,
+                { source, report -> onControllerInput?.invoke(source, report) },
+                { key -> onMediaKey?.invoke(key) },
+                { nowPlayingProvider?.invoke() },
+            )
         } catch (error: IOException) {
             log("BT-C: SESSION 失败 - ${error.message}")
         } finally {

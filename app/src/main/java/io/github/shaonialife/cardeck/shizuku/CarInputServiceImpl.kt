@@ -7,6 +7,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
 import android.view.InputEvent
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import java.lang.reflect.Method
@@ -111,19 +112,26 @@ class CarInputServiceImpl(
             .firstOrNull { it.name == "setDisplayId" && it.parameterTypes.size == 1 }
     }
 
+    private val setKeyDisplayIdMethod: Method? by lazy {
+        KeyEvent::class.java.methods.firstOrNull { it.name == "setDisplayId" && it.parameterTypes.size == 1 }
+    }
+
     private var injectFailLogged = false
 
     private fun inject(
-        event: MotionEvent,
+        event: InputEvent,
         displayId: Int,
     ): Boolean {
         val inj = injector
         if (inj == null) {
-            event.recycle()
+            (event as? MotionEvent)?.recycle()
             return false
         }
         return try {
-            setDisplayIdMethod?.invoke(event, displayId)
+            if (event is KeyEvent && displayId < 0) return false
+            val displayMethod = if (event is KeyEvent) setKeyDisplayIdMethod else setDisplayIdMethod
+            if (event is KeyEvent && displayMethod == null && inj.method.parameterTypes.size == 2) return false
+            displayMethod?.invoke(event, displayId)
             val m = inj.method
             val result: Boolean =
                 when {
@@ -143,8 +151,40 @@ class CarInputServiceImpl(
             }
             false
         } finally {
-            event.recycle()
+            (event as? MotionEvent)?.recycle()
         }
+    }
+
+    /** 保留按下时刻和重复次数，确认键长按/松开不退化成一次性点击。 */
+    override fun keyEvent(
+        displayId: Int,
+        action: Int,
+        keyCode: Int,
+        metaState: Int,
+        downTime: Long,
+        repeatCount: Int,
+        canceled: Boolean,
+    ): Boolean {
+        if (action != KeyEvent.ACTION_DOWN && action != KeyEvent.ACTION_UP) return false
+        val repeats = if (action == KeyEvent.ACTION_UP) 0 else repeatCount
+        val flags =
+            KeyEvent.FLAG_FROM_SYSTEM or
+                (if (repeats == 1) KeyEvent.FLAG_LONG_PRESS else 0) or
+                (if (canceled) KeyEvent.FLAG_CANCELED else 0)
+        val event =
+            KeyEvent(
+                downTime,
+                SystemClock.uptimeMillis(),
+                action,
+                keyCode,
+                repeats,
+                metaState,
+                -1,
+                0,
+                flags,
+                InputDevice.SOURCE_KEYBOARD,
+            )
+        return inject(event, displayId)
     }
 
     @Suppress("DEPRECATION")

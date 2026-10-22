@@ -32,11 +32,14 @@ abstract class SettingsPanelFragment : Fragment() {
             onReady()
             return
         }
+        val host = activity ?: return
+        val targetView = view ?: return
         Bg.run("apps-scan") {
             val scanned = VirtualLauncher.launchableApps(appContext)
             VirtualLauncher.adoptAppsCache(scanned)
-            requireActivity().runOnUiThread {
-                if (!isAdded || isDetached) return@runOnUiThread
+            host.runOnUiThread {
+                // 旋钮快速切换面板或退出设置时，扫描结果不能写入已销毁的旧视图。
+                if (!isAdded || isDetached || view !== targetView) return@runOnUiThread
                 apps = scanned
                 onReady()
             }

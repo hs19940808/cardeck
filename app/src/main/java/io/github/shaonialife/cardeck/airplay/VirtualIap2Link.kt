@@ -4,8 +4,10 @@ import android.content.Context
 import io.github.shaonialife.cardeck.iap2.Iap2Csm
 import io.github.shaonialife.cardeck.iap2.Iap2LinkEngine
 import io.github.shaonialife.cardeck.iap2.Iap2MessageIds
+import io.github.shaonialife.cardeck.iap2.Iap2NowPlayingSession
 import io.github.shaonialife.cardeck.iap2.MfiLengthMemory
-import io.github.shaonialife.cardeck.input.ConsumerKeys
+import io.github.shaonialife.cardeck.input.ControllerReports
+import io.github.shaonialife.cardeck.input.Iap2HidSession
 import java.security.SecureRandom
 import java.util.TimeZone
 import java.util.UUID
@@ -108,15 +110,19 @@ class VirtualIap2Link(
     /** 上一次记录过的链路状态（只在对日志里出现一次状态迁移）。 */
     private var lastLinkState = Iap2LinkEngine.State.IDLE
 
-    // ---- 车机 HID 媒体键（0x6802）状态 ----
-    /** 上一次报文里按下的 Usage 集合（用于判定「新按下」，松开后自动清空）。 */
-    private var lastHidUsages: Set<Int> = emptySet()
+    private val hid = Iap2HidSession(log, nowMillis)
+    private val nowPlaying = Iap2NowPlayingSession({ nowPlayingProvider() }, nowMillis)
 
-    /** 当前这批按键的起始时刻（连续同一按键超过 [HID_HOLD_REPEAT_MILLIS] 才允许连发）。 */
-    private var hidHoldStartedAtMs = 0L
+    /** 只读上层媒体缓存；链路锁内不查询 Android MediaSession。 */
+    internal var nowPlayingProvider: () -> Iap2NowPlayingSession.Snapshot? = { null }
 
-    /** 已打印的参数明细帧数（只打前几帧，之后按需打动作）。 */
-    private var hidReportFrames = 0
+    /** 宿主控制通道退出时释放本隧道输入，迟到帧不能重新按住虚拟屏上的键。 */
+    internal fun close() {
+        synchronized(lock) {
+            hid.close()
+            nowPlaying.close()
+        }
+    }
 
     // ---- MIB3 隧道 MFi 挑战（按车机持久化记忆；与蓝牙链路**独立记**——同一台车
     // 两条链路的认证后端可能不同，实测 MMI 3315 蓝牙认 32B 而 Frida 隧道是 20B） ----
@@ -337,6 +343,8 @@ class VirtualIap2Link(
                     handleFrameLocked(event.bytes)
 
                 is Iap2LinkEngine.Event.Dead -> {
+                    hid.close()
+                    nowPlaying.close()
                     log("IAPLINK: 虚拟链路终止 - ${event.reason ?: "EOF"}")
                     return
                 }
@@ -347,6 +355,9 @@ class VirtualIap2Link(
         flushOutputLocked()
         maybeStartControlCsmLocked()
         checkMfiTimeoutLocked()
+        if (engine.state == Iap2LinkEngine.State.NORMAL) {
+            nowPlaying.poll()?.let { sendCsmLocked(Iap2MessageIds.NOW_PLAYING_UPDATE, it) }
+        }
         flushOutputLocked()
     }
 
@@ -355,6 +366,10 @@ class VirtualIap2Link(
         val state = engine.state
         if (state == lastLinkState) return
         lastLinkState = state
+        if (state == Iap2LinkEngine.State.DEAD) {
+            hid.close()
+            nowPlaying.close()
+        }
         log("IAPLINK: 链路状态 → $state（NORMAL 才可能收到车机 0x6800/0x6802 媒体键）")
     }
 
@@ -448,7 +463,7 @@ class VirtualIap2Link(
     /** 直接投递完整 CSM 帧（Frida 抓的逐字节常量，勿重新编码）。 */
     private fun sendRawCsmLocked(frame: ByteArray) {
         val ok = engine.sendControl(frame, System.nanoTime() / 1_000_000L)
-        val messageId = ((frame[2].toInt() and 0xFF) shl 8) or (frame[3].toInt() and 0xFF)
+        val messageId = ((frame[4].toInt() and 0xFF) shl 8) or (frame[5].toInt() and 0xFF)
         log(
             "IAPLINK: 隧道 tx 0x${messageId.toString(16)} " +
                 "(${Iap2MessageIds.nameOf(messageId)}) ${frame.size}B raw ok=$ok",
@@ -582,59 +597,12 @@ class VirtualIap2Link(
                 log("IAPLINK: MIB3 0x4170 → 0x4171（空列表）")
             }
 
-            Iap2MessageIds.START_NOW_PLAYING_UPDATES -> {
-                if (!mib3) return
-                sendRawCsmLocked(MIB3_NOW_PLAYING_UPDATE_IDLE)
-                // 仪表盘歌词/媒体卡的数据通路（0x5001 + file-transfer 封面）后续接
-                // MediaSessionsState——空态应答是 MIB3 存活的前置，先落这版。
-                log("IAPLINK: MIB3 0x5000 → 0x5001（空态）——仪表盘媒体数据待接")
+            Iap2MessageIds.START_NOW_PLAYING_UPDATES, Iap2MessageIds.STOP_NOW_PLAYING_UPDATES -> {
+                nowPlaying.handle(frame)?.let { sendCsmLocked(Iap2MessageIds.NOW_PLAYING_UPDATE, it) }
+                log("IAPLINK: 媒体订阅消息 0x${frame.messageId.toString(16)} 已处理")
             }
 
-            ids.START_HID -> {
-                // 车机声明「我要开始发 HID 报告了」，通常带描述符（决定报告字节语义）
-                val params = Iap2Csm.parseParams(frame.body)
-                val descriptor = params.map { it.value }.firstOrNull { it.size > 8 }
-                if (descriptor != null) {
-                    hidDescriptor = descriptor
-                    log(
-                        "IAPLINK: 车机 0x6800 StartHID 描述符 ${descriptor.size}B hex=" +
-                            descriptor.joinToString(" ") { "%02x".format(it) }.take(120),
-                    )
-                } else {
-                    log("IAPLINK: 车机 0x6800 StartHID（无描述符）参数=${params.map { it.id }}")
-                }
-            }
-
-            ids.ACCESSORY_HID_REPORT -> {
-                // 方向盘/面板媒体键。
-                //
-                // 2026-10-20 本田 HFT 实测帧（11B）：
-                //   00 06 00 00 00 03 | 00 05 00 01 04
-                //   param id=0 值 00 03（报告类型/描述，恒定）← 之前被当成报告值
-                //   param id=1 值 04（真正的 HID 报文）
-                // 旧代码取「第一个 1~8 字节的 param」→ 永远拿到 00 03，位图里一位都不置，
-                // 于是日志一直打 `usage=无 keyCode=0`，按键到了却点不出任何动作。
-                val params = Iap2Csm.parseParams(frame.body)
-                val report = hidReportFromParams(params)
-                val keyMap = hidDescriptor?.let(ConsumerKeys::parseDescriptor)
-                val usages =
-                    when {
-                        report == null -> emptyList()
-                        keyMap != null -> keyMap.usagesFor(report)
-                        // 无描述符：退化为「单字节即 Usage ID」
-                        else -> listOf(report[0].toInt() and 0xFF).filter { it != 0 }
-                    }
-                if (hidReportFrames < HID_REPORT_VERBOSE_FRAMES) {
-                    hidReportFrames++
-                    log(
-                        "IAPLINK: 车机 0x6802 params=" +
-                            params.joinToString(",") { "${it.id}=" + it.value.joinToString("") { b -> "%02x".format(b) } } +
-                            " 报告=" + (report?.joinToString(" ") { "%02x".format(it) } ?: "空") +
-                            " 位图=" + (keyMap?.isArray?.let { if (it) "Array" else "Variable" } ?: "无描述符"),
-                    )
-                }
-                fireHidKeysLocked(usages)
-            }
+            ids.START_HID, ids.ACCESSORY_HID_REPORT, ids.STOP_HID -> hid.handle(frame)
 
             else -> {
                 // 未处理的消息也留痕：车机若用非常规 ID 下发媒体键/按键，这里能第一时间
@@ -650,41 +618,6 @@ class VirtualIap2Link(
                     )
                 }
             }
-        }
-    }
-
-    /**
-     * 把一批「本次按下的 Usage」转成 Android 媒体键注入。
-     *
-     * 车机的 HID 报告是**状态式**的：按住会以 ~10Hz 连推同一个位图，松开推 0x00。
-     * 因此只在「新出现」时触发一次（边沿触发），否则一次长按会跳掉几十首歌；
-     * 只有在同一按键持续按住超过 [HID_HOLD_REPEAT_MILLIS] 时才允许再触发，
-     * 保持方向盘长按「连续切歌」的手感。
-     */
-    private fun fireHidKeysLocked(usages: List<Int>) {
-        val now = nowMillis()
-        if (usages.isEmpty()) {
-            lastHidUsages = emptySet()
-            hidHoldStartedAtMs = 0L
-            return
-        }
-        val fresh = usages.filter { it !in lastHidUsages }
-        val repeat =
-            fresh.isEmpty() &&
-                hidHoldStartedAtMs > 0 &&
-                now - hidHoldStartedAtMs >= HID_HOLD_REPEAT_MILLIS
-        lastHidUsages = usages.toSet()
-        if (fresh.isNotEmpty()) hidHoldStartedAtMs = now
-        if (fresh.isEmpty() && !repeat) return
-        if (repeat) hidHoldStartedAtMs = now
-        val firing = if (fresh.isNotEmpty()) fresh else usages
-        for (usage in firing) {
-            val keyCode = ConsumerKeys.keyCodeFor(usage)
-            log(
-                "IAPLINK: 车机媒体键 ${ConsumerKeys.nameOf(usage)}(0x%02x) → keyCode=".format(usage) +
-                    (if (keyCode != 0) "$keyCode 已注入" else "无对应 Android 键（忽略）"),
-            )
-            if (keyCode != 0) onMediaKey?.invoke(keyCode)
         }
     }
 
@@ -779,10 +712,18 @@ class VirtualIap2Link(
      * 车机方向盘/面板的上一曲、下一曲在 CarPlay 里走 `0x6802 AccessoryHIDReport`，
      * 只有 iAP2 链路真正建立后才会来（见 [eventLinkArmed]）。
      */
-    var onMediaKey: ((Int) -> Unit)? = null
+    var onMediaKey: ((Int) -> Unit)?
+        get() = hid.onMediaKey
+        set(value) {
+            hid.onMediaKey = value
+        }
 
-    /** 车机在 0x6800 StartHID 里给出的 HID 描述符（解析报告用；null = 未提供）。 */
-    private var hidDescriptor: ByteArray? = null
+    /** iAP2 按组件/报告编号分流旋钮和导航，停止组件时补发空状态。 */
+    internal var onControllerInput: ((ControllerReports.Report) -> Unit)?
+        get() = hid.onControllerInput
+        set(value) {
+            hid.onControllerInput = value
+        }
 
     fun handleEaData(bytes: ByteArray) {
         eaCount++
@@ -814,30 +755,8 @@ class VirtualIap2Link(
         const val CONTROL_SYN_ROUND_MILLIS = 4_000L
         const val MAX_CONTROL_SYN_ROUNDS = 5
 
-        /**
-         * 0x6802 AccessoryHIDReport 的报文参数号。
-         *
-         * 本田 HFT 实测：param 0 = 报告类型/描述（`00 03`，永远不变），
-         * param 1 = 真正的 HID 报文（如 `04` = 下一首）。取错参数号等于所有按键都解码成「无」。
-         */
-        const val HID_REPORT_DATA_PARAM = 1
-
-        /** 参数明细只打前几帧（之后每帧都会触发按键动作，日志已足够）。 */
-        const val HID_REPORT_VERBOSE_FRAMES = 8
-
-        /** 同一按键持续按住多久才允许再次触发（模拟长按连发，短按绝不重复）。 */
-        const val HID_HOLD_REPEAT_MILLIS = 1_500L
-
-        /**
-         * 0x6802 的参数表 → HID 报文。
-         *
-         * 优先取 param [HID_REPORT_DATA_PARAM]；缺省（个别车机只给一个参数）时退回
-         * 「最后一个 1~8 字节的参数」——注意**不能取第一个**：本田 HFT 的 param 0 恒为
-         * `00 03`（报告类型），当成报文值会让所有按键都解成「无」。
-         */
-        fun hidReportFromParams(params: List<Iap2Csm.Param>): ByteArray? =
-            params.firstOrNull { it.id == HID_REPORT_DATA_PARAM }?.value?.takeIf { it.isNotEmpty() }
-                ?: params.lastOrNull { it.value.isNotEmpty() && it.value.size <= 8 }?.value
+        /** 兼容既有测试入口；消息参数与组件管理由两条 iAP2 通道共用。 */
+        fun hidReportFromParams(params: List<Iap2Csm.Param>): ByteArray? = Iap2HidSession.reportFromParams(params)
 
         // ---- MIB3 消息号（无正式名/未入 Iap2MessageIds 的小集合） ----
         const val MFI_AUTH_SERIAL = 0xAA06
@@ -867,12 +786,7 @@ class VirtualIap2Link(
             hex("4040000efff00004000000040001")
 
         /** 0x5001 NowPlayingUpdate 空态（无媒体/无播放）。 */
-        internal val MIB3_NOW_PLAYING_UPDATE_IDLE: ByteArray =
-            hex(
-                "404000555001002a00000005000100000800040000000000050006000005000c0000" +
-                    "0500100000050012000005001a8000250001000500000000080001000000000005" +
-                    "000500000500060000050007000005001000",
-            )
+        internal val MIB3_NOW_PLAYING_UPDATE_IDLE: ByteArray = Iap2NowPlayingSession.IDLE_FRAME
 
         /** 0x4158 CommunicationsUpdate 空态（无 SIM/无信号场景的可用占位）。 */
         internal val MIB3_COMMUNICATIONS_UPDATE_IDLE: ByteArray =

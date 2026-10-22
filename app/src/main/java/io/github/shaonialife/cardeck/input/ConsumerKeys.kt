@@ -32,6 +32,14 @@ object ConsumerKeys {
         val usages: List<Int>,
         val isArray: Boolean,
     ) {
+        internal var layout: HidInputLayout? = null
+
+        /** 短包不等于全部松开，调用方应保留上一个完整报告的状态。 */
+        fun accepts(report: ByteArray): Boolean = layout?.fieldsFor(report) != null || layout == null && report.isNotEmpty()
+
+        /** 每个 Report ID 各自上报状态，不能用另一组报告的空位释放本组按键。 */
+        internal fun reportId(report: ByteArray): Int = layout?.fieldsFor(report)?.firstOrNull()?.reportId ?: 0
+
         /** 报告值 → Usage ID；0 或越界返回 null（0 = 无按键/释放）。 */
         fun usageFor(reportValue: Int): Int? {
             if (reportValue == 0) return null
@@ -56,6 +64,17 @@ object ConsumerKeys {
          */
         fun usagesFor(report: ByteArray): List<Int> {
             if (report.isEmpty()) return emptyList()
+            layout?.let { parsed ->
+                return parsed
+                    .fieldsFor(report)
+                    .orEmpty()
+                    .filter { it.applicationPage == USAGE_PAGE_CONSUMER }
+                    .mapNotNull { field ->
+                        val value = field.value(report)
+                        val usage = field.usage(value)
+                        usage?.code?.takeIf { usage.page == USAGE_PAGE_CONSUMER && it != 0 && (!field.variable || value != 0) }
+                    }.distinct()
+            }
             if (isArray) return listOfNotNull(usageFor(report[0].toInt() and 0xFF))
             val pressed = ArrayList<Int>(usages.size)
             usages.forEachIndexed { index, usage ->
@@ -76,62 +95,11 @@ object ConsumerKeys {
      * 支持短条目编码（bSize: 0→0字节 / 1→1 / 2→2 / 3→4）。
      */
     fun parseDescriptor(descriptor: ByteArray): KeyMap? {
-        var index = 0
-        var page = 0
-        var inConsumerApp = false
-        var sawConsumerPage = false
-        val usages = ArrayList<Int>()
-        var isArray = true
-
-        while (index < descriptor.size) {
-            val prefix = descriptor[index].toInt() and 0xFF
-            val size = prefix and 0x03
-            val type = (prefix shr 2) and 0x03
-            val tag = (prefix shr 4) and 0x0F
-            val dataBytes =
-                when (size) {
-                    0 -> 0
-                    1 -> 1
-                    2 -> 2
-                    else -> 4
-                }
-            if (index + 1 + dataBytes > descriptor.size) break
-            var value = 0
-            for (offset in 0 until dataBytes) {
-                value = value or ((descriptor[index + 1 + offset].toInt() and 0xFF) shl (8 * offset))
-            }
-            index += 1 + dataBytes
-
-            when {
-                // 全局项：Usage Page
-                type == 1 && tag == 0x0 -> {
-                    page = value
-                    if (value == USAGE_PAGE_CONSUMER) sawConsumerPage = true
-                }
-                // 全局项：Logical Maximum（Array 报告里用于界定下标范围）
-                type == 1 && tag == 0x2 -> Unit
-                // 局部项：Usage（1 或 2 字节）——收进当前 Consumer Application 的数组
-                type == 2 && tag == 0x0 -> {
-                    if (inConsumerApp && sawConsumerPage) usages += value
-                }
-                // 主项：Collection / EndCollection
-                type == 0 && tag == 0xA -> {
-                    // 仅当当前页是 Consumer 且处于顶层 Application 时开启收集
-                    if (!inConsumerApp && page == USAGE_PAGE_CONSUMER) inConsumerApp = true
-                }
-                type == 0 && tag == 0xC -> {
-                    if (inConsumerApp) return KeyMap(usages, isArray)
-                }
-                // 主项：Input——bit1=0 表示 Array（值是下标），=1 表示 Variable（值是位图）。
-                // bit0=1 是 Constant（描述符尾部的补齐位，如 `75 03 95 01 81 03`），
-                // 不参与按键语义，不能让它覆盖前面的真实报告格式。
-                type == 0 && tag == 0x8 -> {
-                    if ((value and 0x01) == 0) isArray = (value and 0x02) == 0
-                }
-            }
-        }
-        if (sawConsumerPage && usages.isNotEmpty()) return KeyMap(usages, isArray)
-        return null
+        val layout = HidInputLayout.parse(descriptor) ?: return null
+        val fields = layout.fields.filter { it.applicationPage == USAGE_PAGE_CONSUMER }
+        val usages = fields.flatMap { it.usages }.filter { it.page == USAGE_PAGE_CONSUMER }.map { it.code }
+        if (usages.isEmpty()) return null
+        return KeyMap(usages, fields.none { it.variable }).also { it.layout = layout }
     }
 
     /** Usage ID → Android 媒体键；无对应键返回 0（如 Repeat）。 */
@@ -144,6 +112,7 @@ object ConsumerKeys {
             0xB5 -> KeyEvent.KEYCODE_MEDIA_NEXT
             0xB6 -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
             0xB9 -> KeyEvent.KEYCODE_MEDIA_STOP
+            0xCD -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
             else -> 0
         }
 
@@ -158,6 +127,7 @@ object ConsumerKeys {
             0xB6 -> "上一首"
             0xB9 -> "停止"
             0xBC -> "循环"
+            0xCD -> "播放/暂停"
             else -> "未知(0x%02x)".format(usage)
         }
 }
